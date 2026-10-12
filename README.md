@@ -130,6 +130,17 @@ python3 test/benchmark-small-files.py --server ./ftpsrv-macos --curl /path/to/cu
 
 The benchmark and block-mode interoperability checks use only PASV/EPSV.
 
+To benchmark an existing anonymous FTP server, provide its host, port, and an
+existing absolute test directory instead of `--server`:
+
+```console
+python3 test/benchmark-small-files.py --host 192.168.1.5 --port 2121 \
+  --remote-dir /data/modeb --curl /path/to/curl
+```
+
+Remote runs use an exclusive subdirectory, verify uploads by reading them back
+in the measured downloads, and remove only the files and directories they create.
+
 The macOS build reuses the POSIX platform stubs; SELF decryption of encrypted
 console segments requires the corresponding console payload.
 
