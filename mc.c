@@ -40,6 +40,12 @@ along with this program; see the file COPYING. If not, see
 #define FTP_MC_RING_SIZE (1024 * 1024)
 #endif
 
+/* All buffers of one transfer: the ring plus the send and receive socket
+   buffers of every connection. */
+#ifndef FTP_MC_BUFFER_BUDGET
+#define FTP_MC_BUFFER_BUDGET (16 * 1024 * 1024)
+#endif
+
 /* Time allowed to establish all N connections. */
 #ifndef FTP_MC_CONNECT_TIMEOUT_SEC
 #define FTP_MC_CONNECT_TIMEOUT_SEC 30
@@ -50,10 +56,9 @@ along with this program; see the file COPYING. If not, see
 #define FTP_MC_STALL_TIMEOUT_SEC 60
 #endif
 
-/* Each connection gets this share of the single-connection socket buffer,
-   so a set uses about as much kernel memory as one connection. */
+/* Smallest socket buffer a connection may get within the budget. */
 #ifndef FTP_MC_MIN_SOCK_BUFSIZE
-#define FTP_MC_MIN_SOCK_BUFSIZE (256 * 1024)
+#define FTP_MC_MIN_SOCK_BUFSIZE (128 * 1024)
 #endif
 
 #define MC_DEFAULT_STRIPE 4096
@@ -113,10 +118,48 @@ static unsigned mc_max_conn = FTP_MC_MAX_CONN;
 static uint32_t mc_max_stripe = FTP_MC_MAX_STRIPE;
 
 
+/**
+ * Ring size for N connections with stripe S.
+ **/
+static uint64_t
+mc_ring_bytes(unsigned n, uint64_t s) {
+  uint64_t ring = 2 * (uint64_t)n * s;
+  return ring < FTP_MC_RING_SIZE ? FTP_MC_RING_SIZE : ring;
+}
+
+/**
+ * Largest stripe for N connections that keeps the ring and the smallest
+ * socket buffers within the budget.
+ **/
+static uint64_t
+mc_stripe_limit(unsigned n) {
+  uint64_t sockets = 2 * (uint64_t)n * FTP_MC_MIN_SOCK_BUFSIZE;
+  uint64_t limit = mc_max_stripe;
+
+  if(sockets + FTP_MC_RING_SIZE > FTP_MC_BUFFER_BUDGET) {
+    return 0;
+  }
+  if((FTP_MC_BUFFER_BUDGET - sockets) / (2 * (uint64_t)n) < limit) {
+    limit = (FTP_MC_BUFFER_BUDGET - sockets) / (2 * (uint64_t)n);
+  }
+  return limit;
+}
+
 int
 ftp_mc_configure(unsigned max_conn, uint32_t max_stripe) {
+  unsigned saved_conn = mc_max_conn;
+  uint32_t saved_stripe = mc_max_stripe;
+
   if(max_conn < 1 || max_conn > 256 || max_stripe < MC_DEFAULT_STRIPE ||
      FTP_MC_MIN_STRIPE > MC_DEFAULT_STRIPE) {
+    return -1;
+  }
+  mc_max_conn = max_conn;
+  mc_max_stripe = max_stripe;
+  /* The default stripe must fit the budget with every connection. */
+  if(mc_stripe_limit(max_conn) < MC_DEFAULT_STRIPE) {
+    mc_max_conn = saved_conn;
+    mc_max_stripe = saved_stripe;
     return -1;
   }
   mc_max_conn = max_conn;
@@ -306,11 +349,16 @@ mc_poll(ftp_env_t *env, ftp_mc_t *mc, nfds_t nfds,
 }
 
 
+/**
+ * Send and receive buffer size of each socket: what the budget leaves
+ * after the ring, shared by the 2 * N buffers, up to the size used for a
+ * single data connection.
+ **/
 static int
 mc_sock_bufsize(const ftp_mc_t *mc) {
-  size_t size = IO_SOCK_DATA_BUFSIZE / mc->n;
-  return (int)(size < FTP_MC_MIN_SOCK_BUFSIZE ? FTP_MC_MIN_SOCK_BUFSIZE :
-               size);
+  uint64_t size = (FTP_MC_BUFFER_BUDGET - mc_ring_bytes(mc->n, mc->stripe)) /
+                  (2 * (uint64_t)mc->n);
+  return (int)(size > IO_SOCK_DATA_BUFSIZE ? IO_SOCK_DATA_BUFSIZE : size);
 }
 
 /**
@@ -457,8 +505,8 @@ ftp_mc_opts(ftp_env_t *env, const char *arg) {
   if(n > mc_max_conn) {
     n = mc_max_conn;
   }
-  if(stripe > mc_max_stripe) {
-    stripe = mc_max_stripe;
+  if(stripe > mc_stripe_limit((unsigned)n)) {
+    stripe = mc_stripe_limit((unsigned)n);
   }
   if(stripe < FTP_MC_MIN_STRIPE) {
     stripe = FTP_MC_MIN_STRIPE;
@@ -814,7 +862,7 @@ ftp_mc_precheck(ftp_env_t *env) {
 int
 ftp_mc_xfer_start(ftp_env_t *env, int prechecked) {
   ftp_mc_t *mc = env->mc;
-  uint64_t ring = FTP_MC_RING_SIZE;
+  uint64_t ring = mc_ring_bytes(mc->n, mc->stripe);
   int reused = mc->open;
   int ready = 0;
 
@@ -825,9 +873,6 @@ ftp_mc_xfer_start(ftp_env_t *env, int prechecked) {
     }
   }
 
-  if(2 * (uint64_t)mc->n * mc->stripe > ring) {
-    ring = 2 * (uint64_t)mc->n * mc->stripe;
-  }
   if(ring > SIZE_MAX / 2 || !(mc->ring = malloc((size_t)ring))) {
     return ftp_active_printf(env, "451 Insufficient memory for the transfer\r\n")
            < 0 ? -1 : 1;

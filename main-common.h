@@ -27,9 +27,10 @@ ftp_print_usage(const char *progname) {
   puts("");
   puts("options:");
   puts("    -p PORT    Bind the socket server to the given PORT (default: 2121)");
-  puts("    -c CONNS   Largest FTPMC connection count, 1-256 (default: 4)");
+  puts("    -c CONNS   Largest FTPMC connection count, 1-60 (default: 16)");
   puts("    -s STRIPE  Largest FTPMC stripe size in octets, at least 4096");
-  puts("               (default: 65536)");
+  puts("               (default: 65536); lowered when N * S needs more");
+  puts("               than the 16 MiB buffer budget of a transfer");
 }
 
 static inline int

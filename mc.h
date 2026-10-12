@@ -34,7 +34,7 @@ along with this program; see the file COPYING. If not, see
 
 /* Largest N the server accepts (the FEAT value). */
 #ifndef FTP_MC_MAX_CONN
-#define FTP_MC_MAX_CONN 4
+#define FTP_MC_MAX_CONN 16
 #endif
 
 /* Largest and smallest stripe sizes the server accepts. */
@@ -47,7 +47,9 @@ along with this program; see the file COPYING. If not, see
 
 /**
  * Change the limits at startup. Returns -1 if they are invalid: max_conn
- * must be 1-256, and the stripe range must include the default of 4096.
+ * must be 1-256, the stripe range must include the default of 4096, and
+ * max_conn connections with that stripe must fit the buffer budget
+ * (FTP_MC_BUFFER_BUDGET, 16 MiB), which allows up to 60 connections.
  **/
 int ftp_mc_configure(unsigned max_conn, uint32_t max_stripe);
 

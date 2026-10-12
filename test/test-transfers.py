@@ -542,13 +542,14 @@ class Transfers(unittest.TestCase):
         return data, socks
 
     def test_mc_negotiation(self):
-        self.assertIn(" MC 4", self.ftp.sendcmd("FEAT").splitlines())
+        self.assertIn(" MC 16", self.ftp.sendcmd("FEAT").splitlines())
         for command in ("MPSV", "MPRT |1|127.0.0.1|5000|"):
             with self.assertRaises(ftplib.error_perm) as error:
                 self.ftp.sendcmd(command)
             self.assertTrue(str(error.exception).startswith("503"))
         self.assertEqual(self.mc_enable(4), (4, 4096))
-        self.assertEqual(self.mc_enable(9, 1048576), (4, 65536))
+        self.assertEqual(self.mc_enable(9, 1048576), (9, 65536))
+        self.assertEqual(self.mc_enable(20), (16, 65536))
         self.assertEqual(self.mc_enable(2, 100), (2, 512))
         self.assertEqual(self.mc_enable(3), (3, 512))
         self.assertEqual(self.mc_enable(1, 4294967295), (1, 65536))
@@ -578,7 +579,7 @@ class Transfers(unittest.TestCase):
         # Larger than the ring and the socket buffers, so it wraps many times.
         self.ftp.voidcmd("TYPE I")
         data = os.urandom(24 * 1024 * 1024 + 4321)
-        for n, stripe in ((4, 4096), (4, 65536), (3, 5000)):
+        for n, stripe in ((4, 4096), (4, 65536), (3, 5000), (16, 65536)):
             with self.subTest(n=n, stripe=stripe):
                 self.mc_enable(n, stripe)
                 self.mc_upload("STOR big.bin", data, stripe)
@@ -586,12 +587,44 @@ class Transfers(unittest.TestCase):
                 downloaded, _ = self.mc_download("RETR big.bin", stripe)
                 self.assertEqual(downloaded, data)
 
+    def test_mc_buffer_budget(self):
+        # The ring (2 * N * S) and the 2 * N socket buffers of at least
+        # 128 KiB must fit in 16 MiB, so large stripes are lowered.
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        for args in (["-c", "61"], ["-s", "4095"]):
+            result = subprocess.run([self.binary, "-p", str(port)] + args,
+                                    stdout=subprocess.DEVNULL, timeout=5)
+            self.assertNotEqual(result.returncode, 0, args)
+        server = subprocess.Popen([self.binary, "-p", str(port), "-s", "4194304"],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(server.wait)
+        self.addCleanup(server.terminate)
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                ftp = ftplib.FTP()
+                ftp.connect("127.0.0.1", port, timeout=5)
+                break
+            except OSError:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.05)
+        with ftp:
+            ftp.login()
+            mib = 1024 * 1024
+            for n, expected in ((16, (16 * mib - 32 * 128 * 1024) // 32),
+                                (2, (16 * mib - 4 * 128 * 1024) // 4), (1, 4194304)):
+                response = ftp.sendcmd(f"OPTS MC {n} 4194304")
+                self.assertEqual(response, f"200 MC {n} {expected}")
+
     def test_mc_preliminary_reply_waits_for_all_connections(self):
         self.ftp.voidcmd("TYPE I")
         (self.root / "mc.bin").write_bytes(b"x" * 10000)
         self.mc_enable(3)
         ports = self.mc_passive(connect=False)
         self.ftp.putcmd("RETR mc.bin")
+        time.sleep(0.3)  # the server is now waiting for the connections
         socks = [self.mc_connect(port) for port in ports]
         self.assertTrue(self.ftp.getresp().startswith("150"))
         self.assertEqual(self.mc_recv(socks, 4096), b"x" * 10000)
