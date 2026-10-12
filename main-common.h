@@ -23,10 +23,32 @@ along with this program; see the file COPYING. If not, see
 
 static inline void
 ftp_print_usage(const char *progname) {
-  printf("usage: %s [-p PORT]\n", progname);
+  printf("usage: %s [-p PORT] [-c CONNS] [-s STRIPE]\n", progname);
   puts("");
   puts("options:");
   puts("    -p PORT    Bind the socket server to the given PORT (default: 2121)");
+  puts("    -c CONNS   Largest FTPMC connection count, 1-256 (default: 4)");
+  puts("    -s STRIPE  Largest FTPMC stripe size in octets, at least 4096");
+  puts("               (default: 65536)");
+}
+
+static inline int
+ftp_parse_uint_arg(const char *arg, unsigned long max, unsigned long *out) {
+  char *endptr = NULL;
+  unsigned long v;
+
+  if(!arg || !out) {
+    return -1;
+  }
+
+  errno = 0;
+  v = strtoul(arg, &endptr, 10);
+  if(errno || endptr == arg || *endptr || v > max) {
+    return -1;
+  }
+
+  *out = v;
+  return 0;
 }
 
 static inline int

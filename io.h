@@ -96,6 +96,12 @@ int io_set_socket_buffers(int fd, int is_data);
 
 
 /**
+ * Same as io_set_socket_buffers() with an explicit size for both buffers.
+ **/
+int io_set_socket_buffers_size(int fd, int size);
+
+
+/**
  * Apply socket buffers, timeouts, and latency settings. Returns -1 with errno
  * set if mandatory settings cannot be applied or buffers cannot be verified.
  **/

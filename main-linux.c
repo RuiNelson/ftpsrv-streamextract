@@ -20,6 +20,7 @@ along with this program; see the file COPYING. If not, see
 
 #include "log.h"
 #include "main-common.h"
+#include "mc.h"
 #include "srv.h"
 
 int
@@ -27,12 +28,28 @@ main(int argc, char* argv[]) {
   uint16_t port = 2121;
   int notify_user = 1;
   int rc;
+  unsigned long mc_conns = FTP_MC_MAX_CONN;
+  unsigned long mc_stripe = FTP_MC_MAX_STRIPE;
   int c;
 
-  while((c=getopt(argc, argv, "p:h")) != -1) {
+  while((c=getopt(argc, argv, "p:c:s:h")) != -1) {
     switch(c) {
     case 'p':
       if(ftp_parse_port_arg(optarg, &port) != 0) {
+        ftp_print_usage(argv[0]);
+        return 1;
+      }
+      break;
+
+    case 'c':
+      if(ftp_parse_uint_arg(optarg, 256, &mc_conns) != 0) {
+        ftp_print_usage(argv[0]);
+        return 1;
+      }
+      break;
+
+    case 's':
+      if(ftp_parse_uint_arg(optarg, UINT32_MAX, &mc_stripe) != 0) {
         ftp_print_usage(argv[0]);
         return 1;
       }
@@ -46,6 +63,11 @@ main(int argc, char* argv[]) {
       ftp_print_usage(argv[0]);
       return 1;
     }
+  }
+
+  if(ftp_mc_configure((unsigned)mc_conns, (uint32_t)mc_stripe) != 0) {
+    ftp_print_usage(argv[0]);
+    return 1;
   }
 
   signal(SIGPIPE, SIG_IGN);

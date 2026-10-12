@@ -277,8 +277,12 @@ io_set_socket_buffer(int fd, int option, const char *name, int requested) {
 
 int
 io_set_socket_buffers(int fd, int is_data) {
-  int buf = is_data ? IO_SOCK_DATA_BUFSIZE : IO_SOCK_CTRL_BUFSIZE;
+  return io_set_socket_buffers_size(fd, is_data ? IO_SOCK_DATA_BUFSIZE :
+                                    IO_SOCK_CTRL_BUFSIZE);
+}
 
+int
+io_set_socket_buffers_size(int fd, int buf) {
   if(io_set_socket_buffer(fd, SO_SNDBUF, "SO_SNDBUF", buf) < 0 ||
      io_set_socket_buffer(fd, SO_RCVBUF, "SO_RCVBUF", buf) < 0) {
     return -1;

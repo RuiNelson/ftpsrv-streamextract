@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -427,6 +428,370 @@ class Transfers(unittest.TestCase):
                 self.assertEqual(sum(line.startswith("> MODE B") for line in log), 1)
                 self.assertEqual(sum(line.startswith("< 125 ") for line in log), 4)
                 self.assertEqual(sum(line.startswith("< 250 Transfer complete") for line in log), 5)
+
+
+    # FTPMC (draft-ftpmc-00): one transfer over several data connections.
+
+    def mc_enable(self, n, stripe=None):
+        response = self.ftp.sendcmd(f"OPTS MC {n}" + (f" {stripe}" if stripe else ""))
+        match = re.fullmatch(r"200 MC (\d+) (\d+)", response)
+        self.assertTrue(match, response)
+        return int(match[1]), int(match[2])
+
+    def mc_passive(self, connect=True):
+        response = self.ftp.sendcmd("MPSV")
+        self.assertTrue(response.startswith("224 "), response)
+        ports = [int(p) for p in re.search(r"\(\|\|\|([\d,]+)\|\)", response)[1].split(",")]
+        if not connect:
+            return ports
+        return [self.mc_connect(port) for port in ports]
+
+    def mc_connect(self, port):
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.addCleanup(sock.close)
+        return sock
+
+    @staticmethod
+    def mc_split(data, n, stripe):
+        parts = [bytearray() for _ in range(n)]
+        for i in range(0, len(data), stripe):
+            parts[(i // stripe) % n] += data[i:i + stripe]
+        return parts
+
+    @staticmethod
+    def mc_join(parts, stripe):
+        # The receiver algorithm of draft Section 6.2, executed literally.
+        out, pos, i = bytearray(), [0] * len(parts), 0
+        while True:
+            k = i % len(parts)
+            chunk = parts[k][pos[k]:pos[k] + stripe]
+            pos[k] += len(chunk)
+            out += chunk
+            if len(chunk) < stripe:
+                assert all(p == len(part) for p, part in zip(pos, parts)), "inconsistent"
+                return bytes(out)
+            i += 1
+
+    def mc_parallel(self, func, socks, args):
+        errors = []
+
+        def run(*a):
+            try:
+                func(*a)
+            except BaseException as error:  # reported in the main thread
+                errors.append(error)
+
+        threads = [threading.Thread(target=run, args=(sock, arg)) for sock, arg in zip(socks, args)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        if errors:
+            raise errors[0]
+
+    def mc_send(self, socks, data, stripe, block=False):
+        def send(sock, part):
+            if block:
+                for offset in range(0, len(part), 65535):
+                    sock.sendall(self.block(part[offset:offset + 65535]))
+                sock.sendall(self.block(descriptor=0x40))
+            else:
+                sock.sendall(part)
+                sock.shutdown(socket.SHUT_WR)
+        self.mc_parallel(send, socks, self.mc_split(data, len(socks), stripe))
+
+    def mc_recv(self, socks, stripe, block=False):
+        parts = [bytearray() for _ in socks]
+
+        def recv(sock, part):
+            if not block:
+                while chunk := sock.recv(1 << 20):
+                    part += chunk
+                return
+            while True:
+                header = self.read_exact(sock, 3)
+                self.assertEqual(header[0] & ~0x40, 0)
+                part += self.read_exact(sock, int.from_bytes(header[1:], "big"))
+                if header[0] & 0x40:
+                    return
+        self.mc_parallel(recv, socks, parts)
+        return self.mc_join(parts, stripe)
+
+    def mc_upload(self, command, data, stripe, socks=None, block=False, rest=None):
+        reused = socks is not None
+        socks = socks or self.mc_passive()
+        if rest is not None:
+            self.ftp.sendcmd(f"REST {rest}")
+        response = self.ftp.sendcmd(command)
+        # All connections were open before the command: 125 (Section 5.3).
+        self.assertTrue(response.startswith("125"), response)
+        self.mc_send(socks, data, stripe, block)
+        response = self.ftp.voidresp()
+        self.assertTrue(response.startswith("250" if block else "226"), response)
+        return socks
+
+    def mc_download(self, command, stripe, socks=None, block=False, rest=None):
+        socks = socks or self.mc_passive()
+        if rest is not None:
+            self.ftp.sendcmd(f"REST {rest}")
+        response = self.ftp.sendcmd(command)
+        self.assertTrue(response.startswith("125"), response)
+        data = self.mc_recv(socks, stripe, block)
+        response = self.ftp.voidresp()
+        self.assertTrue(response.startswith("250" if block else "226"), response)
+        return data, socks
+
+    def test_mc_negotiation(self):
+        self.assertIn(" MC 4", self.ftp.sendcmd("FEAT").splitlines())
+        for command in ("MPSV", "MPRT |1|127.0.0.1|5000|"):
+            with self.assertRaises(ftplib.error_perm) as error:
+                self.ftp.sendcmd(command)
+            self.assertTrue(str(error.exception).startswith("503"))
+        self.assertEqual(self.mc_enable(4), (4, 4096))
+        self.assertEqual(self.mc_enable(9, 1048576), (4, 65536))
+        self.assertEqual(self.mc_enable(2, 100), (2, 512))
+        self.assertEqual(self.mc_enable(3), (3, 512))
+        self.assertEqual(self.mc_enable(1, 4294967295), (1, 65536))
+        for args in ("", "0", "x", "4 0", "4 4294967296", "4 4096 1", "123456", "-1"):
+            with self.subTest(args=args):
+                with self.assertRaises(ftplib.error_perm) as error:
+                    self.ftp.sendcmd("OPTS MC " + args)
+                self.assertTrue(str(error.exception).startswith("501"))
+        self.assertEqual(self.ftp.sendcmd("OPTS MC OFF"), "200 MC OFF")
+        with self.assertRaises(ftplib.error_perm):
+            self.ftp.sendcmd("MPSV")
+
+    def test_mc_stream_roundtrip(self):
+        self.ftp.voidcmd("TYPE I")
+        for n, stripe in ((4, 4096), (3, 512), (2, 65536), (1, 4096)):
+            self.assertEqual(self.mc_enable(n, stripe), (n, stripe))
+            for size in (0, 1, stripe - 1, stripe, n * stripe, n * stripe + 1,
+                         3 * n * stripe + 17, 300001):
+                with self.subTest(n=n, stripe=stripe, size=size):
+                    data = os.urandom(size)
+                    self.mc_upload("STOR mc.bin", data, stripe)
+                    self.assertEqual((self.root / "mc.bin").read_bytes(), data)
+                    downloaded, _ = self.mc_download("RETR mc.bin", stripe)
+                    self.assertEqual(downloaded, data)
+
+    def test_mc_large_transfer(self):
+        # Larger than the ring and the socket buffers, so it wraps many times.
+        self.ftp.voidcmd("TYPE I")
+        data = os.urandom(24 * 1024 * 1024 + 4321)
+        for n, stripe in ((4, 4096), (4, 65536), (3, 5000)):
+            with self.subTest(n=n, stripe=stripe):
+                self.mc_enable(n, stripe)
+                self.mc_upload("STOR big.bin", data, stripe)
+                self.assertEqual((self.root / "big.bin").read_bytes(), data)
+                downloaded, _ = self.mc_download("RETR big.bin", stripe)
+                self.assertEqual(downloaded, data)
+
+    def test_mc_preliminary_reply_waits_for_all_connections(self):
+        self.ftp.voidcmd("TYPE I")
+        (self.root / "mc.bin").write_bytes(b"x" * 10000)
+        self.mc_enable(3)
+        ports = self.mc_passive(connect=False)
+        self.ftp.putcmd("RETR mc.bin")
+        socks = [self.mc_connect(port) for port in ports]
+        self.assertTrue(self.ftp.getresp().startswith("150"))
+        self.assertEqual(self.mc_recv(socks, 4096), b"x" * 10000)
+        self.assertTrue(self.ftp.voidresp().startswith("226"))
+        # In MODE S a set serves one transfer only (Section 7.1).
+        with self.assertRaises(ftplib.error_temp) as error:
+            self.ftp.sendcmd("RETR mc.bin")
+        self.assertTrue(str(error.exception).startswith("425"))
+
+    def test_mc_resume_and_append(self):
+        self.ftp.voidcmd("TYPE I")
+        self.mc_enable(3, 1000)
+        data = os.urandom(10000)
+        target = self.root / "mc.bin"
+        target.write_bytes(data[:4000] + b"junk" * 5000)
+        self.mc_upload("STOR mc.bin", data[4000:], 1000, rest=4000)
+        self.assertEqual(target.read_bytes(), data)
+        downloaded, _ = self.mc_download("RETR mc.bin", 1000, rest=2500)
+        self.assertEqual(downloaded, data[2500:])
+        downloaded, _ = self.mc_download("RETR mc.bin", 1000, rest=len(data))
+        self.assertEqual(downloaded, b"")
+        self.mc_upload("APPE mc.bin", b"tail" * 1000, 1000)
+        self.assertEqual(target.read_bytes(), data + b"tail" * 1000)
+
+    def test_mc_listings(self):
+        names = {f"{i:04d}-" + "x" * 100 for i in range(300)}
+        for name in names:
+            (self.root / name).touch()
+        self.mc_enable(4)
+        listing, _ = self.mc_download("NLST", 4096)
+        self.assertEqual(set(listing.decode().splitlines()) - {".", ".."}, names)
+        self.block_mode()
+        socks = None
+        for command in ("NLST", "LIST", "MLSD"):
+            listing, socks = self.mc_download(command, 4096, socks, block=True)
+            self.assertIn(b"0000-", listing)
+
+    def test_mc_block_persistent_set(self):
+        self.block_mode()
+        self.mc_enable(4, 4096)
+        data = os.urandom(200000)
+        socks = self.mc_upload("STOR mc.bin", data, 4096, block=True)
+        self.assertEqual((self.root / "mc.bin").read_bytes(), data)
+        for _ in range(3):
+            downloaded, _ = self.mc_download("RETR mc.bin", 4096, socks, block=True)
+            self.assertEqual(downloaded, data)
+        self.mc_upload("STOR mc.bin", b"", 4096, socks, block=True)
+        self.assertEqual((self.root / "mc.bin").read_bytes(), b"")
+        self.mc_upload("STOR mc.bin", b"abc", 4096, socks, block=True)
+        downloaded, _ = self.mc_download("RETR mc.bin", 4096, socks, block=True, rest=1)
+        self.assertEqual(downloaded, b"bc")
+        # MODE discards the set (Section 7.2).
+        self.ftp.voidcmd("MODE S")
+        for sock in socks:
+            self.assertEqual(sock.recv(1), b"")
+
+    def test_mc_block_closed_connection_discards_set(self):
+        self.block_mode()
+        self.mc_enable(2)
+        socks = self.mc_upload("STOR mc.bin", b"keep", 4096, block=True)
+        socks[1].close()
+        time.sleep(0.1)
+        with self.assertRaises(ftplib.error_temp) as error:
+            self.ftp.sendcmd("RETR mc.bin")
+        self.assertTrue(str(error.exception).startswith("425"))
+        self.assertEqual(socks[0].recv(1), b"")
+
+    def test_mc_block_invalid_descriptor(self):
+        self.block_mode()
+        self.mc_enable(2)
+        for descriptor in (0x10, 0x80, 0x20, 0x01):
+            with self.subTest(descriptor=descriptor):
+                socks = self.mc_passive()
+                self.assertTrue(self.ftp.sendcmd("STOR bad.bin").startswith("125"))
+                socks[0].sendall(self.block(b"data", descriptor | 0x40))
+                socks[1].sendall(self.block(descriptor=0x40))
+                with self.assertRaises(ftplib.error_temp) as error:
+                    self.ftp.voidresp()
+                self.assertTrue(str(error.exception).startswith("426"))
+
+    def test_mc_active_mode(self):
+        self.ftp.voidcmd("TYPE I")
+        self.mc_enable(3, 2048)
+        listeners = []
+        for _ in range(3):
+            listener = socket.create_server(("127.0.0.1", 0))
+            listener.settimeout(5)
+            self.addCleanup(listener.close)
+            listeners.append(listener)
+        ports = [listener.getsockname()[1] for listener in listeners]
+        for bad, code in ((ports[:2], "501"), ([ports[0]] * 3, "501"),
+                          ([ports[0], ports[1], 80], "504")):
+            with self.assertRaises(ftplib.error_perm) as error:
+                self.ftp.sendcmd("MPRT |1|127.0.0.1|" + ",".join(map(str, bad)) + "|")
+            self.assertTrue(str(error.exception).startswith(code))
+        with self.assertRaises(ftplib.error_perm) as error:
+            self.ftp.sendcmd("MPRT |2|::1|1,2,3|")
+        self.assertTrue(str(error.exception).startswith("522"))
+        with self.assertRaises(ftplib.error_perm) as error:
+            self.ftp.sendcmd("MPRT |1|10.1.2.3|" + ",".join(map(str, ports)) + "|")
+        self.assertTrue(str(error.exception).startswith("504"))
+
+        data = os.urandom(123457)
+        (self.root / "mc.bin").write_bytes(data)
+        self.ftp.voidcmd("MPRT |1|127.0.0.1|" + ",".join(map(str, ports)) + "|")
+        self.assertTrue(self.ftp.sendcmd("RETR mc.bin").startswith("150"))
+        socks = []
+        for listener in listeners:
+            sock, _ = listener.accept()
+            self.addCleanup(sock.close)
+            socks.append(sock)
+        self.assertEqual(self.mc_recv(socks, 2048), data)
+        self.assertTrue(self.ftp.voidresp().startswith("226"))
+
+    def test_mc_single_connection_commands_discard_set(self):
+        self.mc_enable(2)
+        ports = self.mc_passive(connect=False)
+        self.ftp.storbinary("STOR single.bin", io.BytesIO(b"single"))
+        self.assertEqual((self.root / "single.bin").read_bytes(), b"single")
+        for port in ports:
+            with self.assertRaises(OSError):
+                socket.create_connection(("127.0.0.1", port), timeout=2).close()
+
+    def test_mc_upload_failure_keeps_valid_prefix(self):
+        self.ftp.voidcmd("TYPE I")
+        self.mc_enable(3, 4096)
+        data = os.urandom(10 * 4096)
+        target = self.root / "mc.bin"
+        target.write_bytes(b"A" * 100000)
+        socks = self.mc_passive()
+        self.ftp.sendcmd("REST 1000")
+        self.assertTrue(self.ftp.sendcmd("STOR mc.bin").startswith("125"))
+        parts = self.mc_split(data, 3, 4096)
+        parts[1] = parts[1][:4096]  # connection 1 ends early, after stripe 1
+        for sock, part in zip(socks, parts):
+            sock.sendall(part)
+            sock.shutdown(socket.SHUT_WR)
+        with self.assertRaises(ftplib.error_temp) as error:
+            self.ftp.voidresp()
+        self.assertTrue(str(error.exception).startswith("426"))
+        stored = target.read_bytes()
+        self.assertEqual(stored[:1000], b"A" * 1000)
+        self.assertLessEqual(len(stored), 1000 + 4 * 4096)
+        self.assertTrue(data.startswith(stored[1000:]))
+        self.assertEqual(self.ftp.sendcmd(f"SIZE mc.bin"), f"213 {len(stored)}")
+
+    def mc_big_file(self):
+        path = self.root / "big.bin"
+        with open(path, "wb") as out:
+            out.truncate(64 * 1024 * 1024)
+        return path
+
+    def mc_drain(self, sock, timeout):
+        # Read until the server closes the connection.
+        sock.settimeout(timeout)
+        try:
+            while sock.recv(1 << 20):
+                pass
+        except ConnectionResetError:
+            pass
+
+    def test_mc_abort(self):
+        self.ftp.voidcmd("TYPE I")
+        self.mc_big_file()
+        self.mc_enable(4)
+        socks = self.mc_passive()
+        self.assertTrue(self.ftp.sendcmd("RETR big.bin").startswith("125"))
+        time.sleep(0.2)
+        self.ftp.putcmd("ABOR")
+        with self.assertRaises(ftplib.error_temp) as error:
+            self.ftp.getresp()
+        self.assertTrue(str(error.exception).startswith("426"))
+        self.assertTrue(self.ftp.voidresp().startswith("226"))
+        for sock in socks:
+            self.mc_drain(sock, 5)
+        self.assertTrue(self.ftp.voidcmd("NOOP").startswith("200"))
+
+    def test_mc_client_disconnect_frees_connections(self):
+        self.mc_big_file()
+        for command in ("RETR big.bin", "STOR up.bin"):
+            with self.subTest(command=command):
+                ftp = self.connect()
+                ftp.cwd(str(self.root))
+                ftp.voidcmd("TYPE I")
+                ftp.sendcmd("OPTS MC 4")
+                response = ftp.sendcmd("MPSV")
+                ports = [int(p) for p in re.search(r"\|\|\|([\d,]+)\|", response)[1].split(",")]
+                socks = [self.mc_connect(port) for port in ports]
+                self.assertTrue(ftp.sendcmd(command).startswith("125"))
+                if command.startswith("STOR"):
+                    socks[0].sendall(b"x" * 100000)
+                time.sleep(0.2)
+                ftp.sock.close()
+                ftp.file.close()
+                # The server notices at once, not after its stall timeout.
+                started = time.monotonic()
+                for sock in socks:
+                    self.mc_drain(sock, 5)
+                self.assertLess(time.monotonic() - started, 3)
+        self.assertTrue(self.ftp.voidcmd("NOOP").startswith("200"))
 
 
 if __name__ == "__main__":

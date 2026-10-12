@@ -28,6 +28,12 @@ along with this program; see the file COPYING. If not, see
 
 
 /**
+ * FTPMC state (mc.c); NULL while the extension is disabled.
+ **/
+typedef struct ftp_mc ftp_mc_t;
+
+
+/**
  * Data structure that captures the current state of a client.
  **/
 typedef struct ftp_env {
@@ -68,6 +74,7 @@ typedef struct ftp_env {
   struct sockaddr_in data_addr;
   void *xfer_buf;
   size_t xfer_buf_size;
+  ftp_mc_t *mc;
 } ftp_env_t;
 
 

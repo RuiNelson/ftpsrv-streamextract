@@ -31,6 +31,7 @@ along with this program; see the file COPYING. If not, see
 #include "cmd.h"
 #include "io.h"
 #include "log.h"
+#include "mc.h"
 #include "notify.h"
 #include "srv.h"
 
@@ -98,6 +99,8 @@ static ftp_command_t commands[] = {
   {"HELP", ftp_cmd_HELP},
   {"MDTM", ftp_cmd_MDTM},
   {"MODE", ftp_cmd_MODE},
+  {"MPRT", ftp_cmd_MPRT},
+  {"MPSV", ftp_cmd_MPSV},
   {"OPTS", ftp_cmd_OPTS},
   {"STAT", ftp_cmd_STAT},
   {"STRU", ftp_cmd_STRU},
@@ -366,6 +369,7 @@ ftp_thread(void *args) {
   memset(&env.data_addr, 0, sizeof(env.data_addr));
   env.xfer_buf_size = 0;
   env.xfer_buf = NULL;
+  env.mc = NULL;
   memset(&reader, 0, sizeof(reader));
   reader.fd = env.active_fd;
 
@@ -420,6 +424,8 @@ ftp_thread(void *args) {
   if(env.data_fd >= 0) {
     close(env.data_fd);
   }
+
+  ftp_mc_free(&env);
 
   if(env.xfer_buf) {
     free(env.xfer_buf);

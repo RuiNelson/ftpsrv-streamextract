@@ -47,6 +47,7 @@ along with this program; see the file COPYING. If not, see
 #endif
 #include "io.h"
 #include "log.h"
+#include "mc.h"
 #include "notify.h"
 #include "self.h"
 
@@ -428,6 +429,9 @@ int
 ftp_data_write(ftp_env_t *env, const void *buf, size_t count) {
   const unsigned char *p = buf;
 
+  if(ftp_mc_xfer_active(env)) {
+    return ftp_mc_write(env, buf, count);
+  }
   if(env->mode != 'B') {
     return io_nwrite(env->data_fd, buf, count);
   }
@@ -660,6 +664,7 @@ error:
 int
 ftp_data_close(ftp_env_t *env) {
   int rc = 0;
+  ftp_mc_close_set(env);
   env->data_connected = 0;
   env->block_remaining = 0;
   env->block_descriptor = 0;
@@ -904,6 +909,9 @@ ftp_data_open_error_reply(ftp_env_t *env) {
  **/
 static int
 ftp_data_precheck(ftp_env_t *env) {
+  if(ftp_mc_has_set(env)) {
+    return ftp_mc_precheck(env);
+  }
   if(env->mode == 'B' && env->data_connected) {
     unsigned char byte;
     ssize_t n;
@@ -936,6 +944,9 @@ ftp_data_precheck(ftp_env_t *env) {
  **/
 int
 ftp_data_xfer_start(ftp_env_t *env, int prechecked) {
+  if(ftp_mc_has_set(env)) {
+    return ftp_mc_xfer_start(env, prechecked);
+  }
   if(!prechecked) {
     int precheck = ftp_data_precheck(env);
     if(precheck) {
@@ -962,6 +973,9 @@ ftp_data_xfer_start(ftp_env_t *env, int prechecked) {
  **/
 int
 ftp_data_xfer_finish(ftp_env_t *env, int sending) {
+  if(ftp_mc_xfer_active(env)) {
+    return ftp_mc_xfer_finish(env, sending);
+  }
   if(env->mode == 'B') {
     int failed = sending ? ftp_block_write(env, NULL, 0, FTP_BLOCK_EOF) :
                            !env->block_eof;
@@ -3567,6 +3581,10 @@ ftp_cmd_RETR_fd(ftp_env_t *env, int fd) {
   int open_err = ftp_data_xfer_start(env, 1);
   if(open_err) {
     return open_err < 0 ? open_err : 0;
+  }
+
+  if(ftp_mc_xfer_active(env) && env->type != 'A') {
+    return ftp_mc_send_file(env, fd, off, remaining);
   }
 
   if(env->type == 'A') {
@@ -6319,12 +6337,17 @@ ftp_store(ftp_env_t *env, const char *arg, int append) {
     return ftp_perror(env);
   }
 
+  if(env->type == 'A' && ftp_mc_has_set(env)) {
+    return ftp_active_printf(env, "504 TYPE A is not supported on a connection set\r\n");
+  }
+
   int precheck = ftp_data_precheck(env);
   if(precheck) {
     return precheck < 0 ? precheck : 0;
   }
 
-  if(ftp_xfer_buf_reserve(env, IO_COPY_BUFSIZE)) {
+  // A connection set has its own ring buffer for the transfer.
+  if(!ftp_mc_has_set(env) && ftp_xfer_buf_reserve(env, IO_COPY_BUFSIZE)) {
     return ftp_perror(env);
   }
 
@@ -6372,7 +6395,20 @@ ftp_store(ftp_env_t *env, const char *arg, int append) {
     return err;
   }
 
-  if(env->type == 'A') {
+  if(ftp_mc_xfer_active(env)) {
+    uint64_t written = 0;
+    if(ftp_mc_recv_file(env, fd, &written)) {
+      int saved_errno = errno;
+      // Keep only the valid prefix, so SIZE gives the restart point.
+      if(!append) {
+        (void)ftruncate(fd, off + (off_t)written);
+      }
+      close(fd);
+      errno = saved_errno;
+      return ftp_mc_xfer_fail(env);
+    }
+    off += (off_t)written;
+  } else if(env->type == 'A') {
     if(ftp_copy_ascii_in(env, fd, &off)) {
       err = ftp_data_xfer_error_reply(env);
       ftp_data_close(env);
@@ -6525,7 +6561,8 @@ ftp_cmd_FEAT(ftp_env_t *env, const char *arg) {
                            " SITE AUTHID\r\n"
                            " UTF8\r\n"
                            " REST STREAM\r\n"
-                           "211 End\r\n");
+                           " MC %u\r\n"
+                           "211 End\r\n", ftp_mc_max_conn());
 }
 
 /**
@@ -6539,6 +6576,9 @@ ftp_cmd_OPTS(ftp_env_t *env, const char *arg) {
 
   if(!*arg) {
     return ftp_active_printf(env, "501 Usage: OPTS UTF8 ON\r\n");
+  }
+  if(!strncasecmp(arg, "MC", 2) && (arg[2] == ' ' || !arg[2])) {
+    return ftp_mc_opts(env, arg + 2);
   }
 
   len = strcspn(arg, " ");
@@ -6772,6 +6812,13 @@ ftp_cmd_ALLO(ftp_env_t *env, const char *arg) {
 int
 ftp_cmd_ABOR(ftp_env_t *env, const char *arg) {
   (void)arg;
+  if(ftp_mc_take_abort(env)) {
+    // The interrupted transfer already got its 426.
+    ftp_close_data_fds(env);
+    env->data_offset = 0;
+    env->data_offset_is_rest = 0;
+    return ftp_active_printf(env, "226 Abort successful\r\n");
+  }
   int had_stream_socket = env->data_fd >= 0 && env->mode != 'B';
   ftp_close_data_fds(env);
   env->data_addr.sin_port = 0;

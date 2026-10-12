@@ -38,6 +38,43 @@ Note: the SELF command operates on induvidual connections so use e.g.,
 john@localhost:ftpsrv$ curl -o libkernel.sprx -Q SELF ftp://ps5:2121/system/common/lib/libkernel.sprx
 ```
 
+## Multiple data connections (FTPMC)
+The server implements [FTPMC][ftpmc] (draft-ftpmc-00), which carries one
+transfer over N data connections in parallel: the data stream is cut into
+stripes of S octets, and stripe i goes on connection i mod N. It works in
+`MODE S` and `MODE B`, for `RETR`, `STOR`, `APPE` and listings.
+
+```
+C: OPTS MC 4 65536
+S: 200 MC 4 65536
+C: MPSV
+S: 224 Entering Multi-Passive Mode (|||50000,50001,50002,50003|)
+C: RETR file.bin
+S: 125 Data connections already open; transfer starting (MC 4 65536)
+S: 226 Transfer complete
+```
+
+`FEAT` lists ` MC 4`. By default the server accepts up to 4 connections and
+stripes up to 64 KiB; a larger request gets these values in the `200 MC`
+reply. `MPRT` is the active-mode equivalent, and only connects to the client's
+own address. In `MODE B` the connection set stays open between transfers.
+
+Each transfer runs in the session thread with non-blocking sockets and
+`poll()`. Data goes through one ring buffer (1 MiB, or 2 × N × S when larger)
+that exists only during the transfer, so idle sessions hold no buffer, even
+with an open `MODE B` set. Each connection reads or writes its stripes with
+scatter/gather I/O, and the file is read and written with large sequential
+calls, so an upload that fails leaves a valid prefix on disk. Each data
+socket gets an equal share of the usual data socket buffer, at least 256 KiB.
+
+A transfer ends at once, freeing its connections and buffer, when the client
+closes the control connection or sends `ABOR`, and fails with `426` when no
+connection makes progress for 60 seconds. Data connections use TCP keepalive,
+so a client that vanishes also frees an idle set.
+
+The limits can be raised with `-c CONNS` and `-s STRIPE` on Linux and macOS,
+or at compile time with `-DFTP_MC_MAX_CONN=8 -DFTP_MC_MAX_STRIPE=1048576`.
+
 ## Additional commands
 These commands are implemented but were not previously documented here:
  - DSIZ <path> - report recursive directory size (errors if path is a file).
@@ -167,3 +204,4 @@ ftpsrv is licensed under the GPLv3+.
 [sdk-ps5]: https://github.com/ps5-payload-dev/sdk
 [issues]: https://github.com/ps5-payload-dev/ftpsrv/issues/new
 [ftp-rfc]: https://www.rfc-editor.org/rfc/rfc959.html#section-3.4.2
+[ftpmc]: https://github.com/RuiNelson/FTPMC
