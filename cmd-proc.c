@@ -99,32 +99,6 @@ ftp_proc_data_xfer_error_reply(ftp_env_t *env) {
 }
 
 static int
-ftp_proc_data_open_error_reply(ftp_env_t *env) {
-  int e = errno;
-  if(e == ENOTCONN) {
-    return ftp_active_printf(env, "425 Use PORT or PASV first\r\n");
-  }
-  if(e == EACCES) {
-    return ftp_active_printf(env, "425 Can't open data connection\r\n");
-  }
-  errno = e;
-  return ftp_perror(env);
-}
-
-static int
-ftp_proc_data_precheck(ftp_env_t *env) {
-  if(!env->data_addr.sin_port && env->passive_fd < 0) {
-    errno = ENOTCONN;
-    int err = ftp_proc_data_open_error_reply(env);
-    if(err < 0) {
-      return -1;
-    }
-    return 1;
-  }
-  return 0;
-}
-
-static int
 ftp_proc_xfer_start(ftp_env_t *env, ftp_proc_xfer_t *x) {
   memset(x, 0, sizeof(*x));
   x->env = env;
@@ -141,25 +115,12 @@ ftp_proc_xfer_start(ftp_env_t *env, ftp_proc_xfer_t *x) {
     }
   }
 
-  int precheck = ftp_proc_data_precheck(env);
-  if(precheck) {
+  int err = ftp_data_xfer_start(env, 0);
+  if(err) {
     if(x->free_buf) {
       free(x->buf);
     }
-    return precheck < 0 ? -1 : 1;
-  }
-  if(ftp_active_printf(env, "150 Opening data transfer\r\n")) {
-    if(x->free_buf) {
-      free(x->buf);
-    }
-    return -1;
-  }
-  if(ftp_data_open(env)) {
-    int err = ftp_proc_data_open_error_reply(env);
-    if(x->free_buf) {
-      free(x->buf);
-    }
-    return err < 0 ? -1 : 1;
+    return err;
   }
 
   return 0;
@@ -181,7 +142,7 @@ ftp_proc_xfer_write_raw(ftp_proc_xfer_t *x, const void *data, size_t len) {
   if(x->failed) {
     return -1;
   }
-  if(io_nwrite(x->env->data_fd, data, len)) {
+  if(ftp_data_write(x->env, data, len)) {
     (void)ftp_proc_data_xfer_error_reply(x->env);
     x->failed = 1;
     return -1;
@@ -268,16 +229,12 @@ ftp_proc_xfer_finish(ftp_env_t *env, ftp_proc_xfer_t *x) {
   if(!x->failed) {
     (void)ftp_proc_xfer_flush(x);
   }
-  if(ftp_data_close(env)) {
-    (void)ftp_perror(env);
-    x->failed = 1;
-  }
-
   ftp_proc_xfer_release(x);
   if(x->failed) {
+    ftp_data_close(env);
     return 0;
   }
-  return ftp_active_printf(env, "226 Transfer complete\r\n");
+  return ftp_data_xfer_finish(env, 1);
 }
 
 static const char *

@@ -335,6 +335,11 @@ ftp_thread(void *args) {
   env.active_fd   = (int)(long)args;
 
   env.type        = 'I';
+  env.mode        = 'S';
+  env.data_connected = 0;
+  env.block_remaining = 0;
+  env.block_descriptor = 0;
+  env.block_eof = 0;
   env.data_offset = 0;
   env.data_offset_is_rest = 0;
   env.self2elf    = 0;

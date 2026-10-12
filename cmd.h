@@ -37,6 +37,11 @@ typedef struct ftp_env {
   char cwd[PATH_MAX];
 
   char type;
+  char mode;
+  int data_connected;
+  size_t block_remaining;
+  unsigned char block_descriptor;
+  int block_eof;
   int self2elf;
   int self_verify;
   off_t data_offset;
@@ -168,6 +173,26 @@ int ftp_data_open(ftp_env_t *env);
  * Close an existing data connection.
  **/
 int ftp_data_close(ftp_env_t *env);
+
+
+/**
+ * Start a transfer (125 for a kept MODE B connection, otherwise 150).
+ * Returns 1 if an error was reported, -1 on control connection failure.
+ **/
+int ftp_data_xfer_start(ftp_env_t *env, int prechecked);
+
+
+/**
+ * Write payload bytes, framing them when MODE B is selected.
+ **/
+int ftp_data_write(ftp_env_t *env, const void *buf, size_t count);
+
+
+/**
+ * Complete a successful transfer, sending EOF when sending is true.
+ * MODE B keeps the connection and replies 250; MODE S closes it and replies 226.
+ **/
+int ftp_data_xfer_finish(ftp_env_t *env, int sending);
 
 
 /**

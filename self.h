@@ -16,7 +16,7 @@ along with this program; see the file COPYING. If not, see
 
 #pragma once
 
-#include <elf.h>
+#include "elf-compat.h"
 #include <stddef.h>
 #include <stdint.h>
 
