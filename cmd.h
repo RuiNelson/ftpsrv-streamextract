@@ -42,6 +42,12 @@ typedef struct ftp_env {
   size_t block_remaining;
   unsigned char block_descriptor;
   int block_eof;
+  unsigned char block_header[3];
+  size_t block_header_len;
+  int block_err;
+  unsigned char *block_rbuf;
+  size_t block_rbuf_off;
+  size_t block_rbuf_len;
   int self2elf;
   int self_verify;
   off_t data_offset;

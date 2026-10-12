@@ -67,6 +67,7 @@ along with this program; see the file COPYING. If not, see
 #define FTP_BLOCK_RESTART 0x10
 #define FTP_BLOCK_INVALID 0x0f
 #define FTP_BLOCK_MAX 65535
+#define FTP_BLOCK_READ_AHEAD (256 * 1024)
 
 // #define IO_USE_SENDFILE  // Disabled. Speed x2 down ?!
 
@@ -193,6 +194,8 @@ ftp_data_open(ftp_env_t *env) {
   env->block_remaining = 0;
   env->block_descriptor = 0;
   env->block_eof = 0;
+  env->block_header_len = 0;
+  env->block_err = 0;
   if(env->mode == 'B' && env->data_connected) {
     return 0;
   }
@@ -286,61 +289,96 @@ ftp_data_recv(ftp_env_t *env, void *buf, size_t count) {
 }
 
 /**
- * Read payload without consuming any bytes beyond the MODE B EOF block.
- * Restart markers are metadata; EOR and suspect-data flags do not change
- * the payload of the supported STRU F transfers.
+ * Read MODE B payload into buf until it is full or the EOF block ends the
+ * transfer. Socket reads go through a read-ahead buffer, so one recv() can
+ * carry several blocks and the caller gets large chunks to write; bytes read
+ * past the EOF block stay buffered for the next transfer on the kept
+ * connection. Restart markers are metadata; EOR and suspect-data flags do not
+ * change the payload of the supported STRU F transfers. An error after some
+ * payload was copied is reported by the next call, so that payload is kept.
  **/
 static ssize_t
 ftp_data_read(ftp_env_t *env, void *buf, size_t count) {
+  unsigned char *out = buf;
+  size_t filled = 0;
+
   if(env->mode != 'B' || !count) {
     return ftp_data_recv(env, buf, count);
   }
+  if(env->block_err) {
+    errno = env->block_err;
+    env->block_err = 0;
+    return -1;
+  }
+  if(!env->block_rbuf &&
+     !(env->block_rbuf = malloc(FTP_BLOCK_READ_AHEAD))) {
+    return -1;
+  }
 
-  for(;;) {
-    if(env->block_remaining) {
-      size_t n = env->block_remaining < count ? env->block_remaining : count;
-      ssize_t r = ftp_data_recv(env, buf, n);
+  while(filled < count && !(env->block_eof && !env->block_remaining)) {
+    if(env->block_rbuf_off == env->block_rbuf_len) {
+      ssize_t r = ftp_data_recv(env, env->block_rbuf, FTP_BLOCK_READ_AHEAD);
       if(r <= 0) {
-        if(!r) {
-          errno = EPIPE;
+        int e = r ? errno : EPIPE;
+        if(filled) {
+          env->block_err = e;
+          return (ssize_t)filled;
         }
+        errno = e;
         return -1;
       }
-      env->block_remaining -= (size_t)r;
+      env->block_rbuf_off = 0;
+      env->block_rbuf_len = (size_t)r;
+    }
+
+    const unsigned char *in = env->block_rbuf + env->block_rbuf_off;
+    size_t avail = env->block_rbuf_len - env->block_rbuf_off;
+
+    if(env->block_remaining) {
+      size_t n = env->block_remaining;
+      if(n > avail) {
+        n = avail;
+      }
+      if(!(env->block_descriptor & FTP_BLOCK_RESTART)) {
+        if(n > count - filled) {
+          n = count - filled;
+        }
+        memcpy(out + filled, in, n);
+        filled += n;
+      }
+      env->block_rbuf_off += n;
+      env->block_remaining -= n;
       if(!env->block_remaining && (env->block_descriptor & FTP_BLOCK_EOF)) {
         env->block_eof = 1;
       }
-      if(env->block_descriptor & FTP_BLOCK_RESTART) {
-        continue;
-      }
-      return r;
-    }
-    if(env->block_eof) {
-      return 0;
+      continue;
     }
 
-    unsigned char header[3];
-    size_t done = 0;
-    while(done < sizeof(header)) {
-      ssize_t r = ftp_data_recv(env, header + done, sizeof(header) - done);
-      if(r <= 0) {
-        if(!r) {
-          errno = EPIPE;
-        }
-        return -1;
-      }
-      done += (size_t)r;
+    while(avail && env->block_header_len < sizeof(env->block_header)) {
+      env->block_header[env->block_header_len++] = *in++;
+      env->block_rbuf_off++;
+      avail--;
     }
-    if(header[0] & FTP_BLOCK_INVALID) {
+    if(env->block_header_len < sizeof(env->block_header)) {
+      continue;
+    }
+    env->block_header_len = 0;
+    if(env->block_header[0] & FTP_BLOCK_INVALID) {
+      if(filled) {
+        env->block_err = EPROTO;
+        return (ssize_t)filled;
+      }
       errno = EPROTO;
       return -1;
     }
-    env->block_descriptor = header[0];
-    env->block_remaining = ((size_t)header[1] << 8) | header[2];
-    if(!env->block_remaining && (header[0] & FTP_BLOCK_EOF)) {
+    env->block_descriptor = env->block_header[0];
+    env->block_remaining = ((size_t)env->block_header[1] << 8) |
+                           env->block_header[2];
+    if(!env->block_remaining && (env->block_descriptor & FTP_BLOCK_EOF)) {
       env->block_eof = 1;
     }
   }
+  return (ssize_t)filled;
 }
 
 /**
@@ -626,6 +664,10 @@ ftp_data_close(ftp_env_t *env) {
   env->block_remaining = 0;
   env->block_descriptor = 0;
   env->block_eof = 0;
+  env->block_header_len = 0;
+  env->block_err = 0;
+  env->block_rbuf_off = 0;
+  env->block_rbuf_len = 0;
   if(env->data_fd >= 0) {
     if(close(env->data_fd)) {
       rc = -1;
@@ -865,6 +907,9 @@ ftp_data_precheck(ftp_env_t *env) {
   if(env->mode == 'B' && env->data_connected) {
     unsigned char byte;
     ssize_t n;
+    if(env->block_rbuf_off < env->block_rbuf_len) {
+      return 0; /* bytes of the next transfer were already read ahead */
+    }
     do {
       n = recv(env->data_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
     } while(n < 0 && errno == EINTR);

@@ -293,6 +293,32 @@ class Transfers(unittest.TestCase):
         self.assertEqual((self.root / "marker-eof.bin").read_bytes(), b"")
         self.block_upload("STOR after.bin", b"healthy", data)
 
+    def test_block_many_blocks_per_read(self):
+        # Several blocks arrive in one socket read and are written in large chunks.
+        self.block_mode()
+        payload = os.urandom(3 * 1024 * 1024 + 123)
+        sizes = [1, 3, 65535, 2, 40000, 65535, 7]
+        wire, offset, i = bytearray(), 0, 0
+        while offset < len(payload):
+            size = sizes[i % len(sizes)]
+            wire += self.block(payload[offset:offset + size])
+            if i == 5:
+                wire += self.block(b"marker", 0x10)
+            offset += size
+            i += 1
+        data = self.block_start("STOR many.bin")
+        data.sendall(bytes(wire) + self.block(descriptor=0x40))
+        self.assertTrue(self.ftp.voidresp().startswith("250"))
+        self.assertEqual((self.root / "many.bin").read_bytes(), payload)
+
+        # A connection lost mid-block keeps every payload byte that arrived.
+        data = self.block_start("STOR cut.bin", data)
+        data.sendall(self.block(payload[:65535]) + self.block(payload[65535:131070])[:1000])
+        data.shutdown(socket.SHUT_WR)
+        with self.assertRaises(ftplib.error_temp):
+            self.ftp.voidresp()
+        self.assertEqual((self.root / "cut.bin").read_bytes(), payload[:65535 + 997])
+
     def test_block_eof_does_not_consume_next_transfer(self):
         self.block_mode()
         data = self.block_start("STOR first.bin")
