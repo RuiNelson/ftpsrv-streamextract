@@ -3,7 +3,9 @@
 
 import ftplib
 import io
+import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -140,14 +142,16 @@ class Transfers(unittest.TestCase):
     def test_failed_data_connection_preserves_file(self):
         target = self.root / "keep.bin"
         target.write_bytes(b"keep these contents")
-        # Reserve an unlistening local port so connect fails immediately.
+        # Choose a closed local port. A bound but unlistening socket can
+        # silently drop SYNs on macOS instead of immediately refusing them.
         with socket.socket() as unused:
             unused.bind(("127.0.0.1", 0))
-            self.ftp.sendport("127.0.0.1", unused.getsockname()[1])
-            self.ftp.putcmd("STOR keep.bin")
-            self.assertTrue(self.ftp.getresp().startswith("150"))
-            with self.assertRaises(ftplib.error_perm):
-                self.ftp.getresp()
+            port = unused.getsockname()[1]
+        self.ftp.sendport("127.0.0.1", port)
+        self.ftp.putcmd("STOR keep.bin")
+        self.assertTrue(self.ftp.getresp().startswith("150"))
+        with self.assertRaises(ftplib.error_perm):
+            self.ftp.getresp()
         self.assertEqual(target.read_bytes(), b"keep these contents")
         self.assertTrue(self.ftp.voidcmd("NOOP").startswith("200"))
 
@@ -160,6 +164,269 @@ class Transfers(unittest.TestCase):
                 with self.assertRaises(ftplib.error_perm):
                     self.ftp.storbinary(command + " link.bin", io.BytesIO(b"new"))
                 self.assertEqual(target.read_bytes(), b"keep")
+
+    def block_mode(self):
+        self.assertTrue(self.ftp.voidcmd("MODE B").startswith("200"))
+        self.ftp.voidcmd("TYPE I")
+
+    @staticmethod
+    def block(payload=b"", descriptor=0):
+        return bytes([descriptor]) + len(payload).to_bytes(2, "big") + payload
+
+    def block_start(self, command, data=None, method="EPSV", rest=None):
+        self.assertIn(method, ("PASV", "EPSV"))
+        reused = data is not None
+        if not reused:
+            if method == "PASV":
+                host, port = self.ftp.makepasv()
+            else:
+                response = self.ftp.sendcmd("EPSV")
+                port = int(re.search(r"\(\|\|\|(\d+)\|\)", response)[1])
+                host = "127.0.0.1"
+            data = socket.create_connection((host, port), timeout=5)
+            self.addCleanup(data.close)
+        if rest is not None:
+            self.ftp.sendcmd(f"REST {rest}")
+        response = self.ftp.sendcmd(command)
+        self.assertTrue(response.startswith("125" if reused else "150"), response)
+        data.settimeout(5)
+        return data
+
+    def block_upload(self, command, payload, data=None, **kwargs):
+        data = self.block_start(command, data, **kwargs)
+        for offset in range(0, len(payload), 65535):
+            data.sendall(self.block(payload[offset:offset + 65535]))
+        data.sendall(self.block(descriptor=0x40))
+        self.assertTrue(self.ftp.voidresp().startswith("250"))
+        return data
+
+    def read_exact(self, data, size):
+        result = bytearray()
+        while len(result) < size:
+            chunk = data.recv(size - len(result))
+            self.assertTrue(chunk, "Data socket closed before the EOF block")
+            result.extend(chunk)
+        return bytes(result)
+
+    def block_download(self, command, data=None, **kwargs):
+        data = self.block_start(command, data, **kwargs)
+        result = bytearray()
+        while True:
+            header = self.read_exact(data, 3)
+            self.assertEqual(header[0] & 0x0f, 0)
+            payload = self.read_exact(data, int.from_bytes(header[1:], "big"))
+            if not header[0] & 0x10:
+                result.extend(payload)
+            if header[0] & 0x40:
+                break
+        self.assertTrue(self.ftp.voidresp().startswith("250"))
+        return bytes(result), data
+
+    def test_block_roundtrip_and_connection_reuse(self):
+        self.block_mode()
+        payload = bytes(range(256)) * 9000
+        for method in ("EPSV", "PASV"):
+            with self.subTest(method=method):
+                data = self.block_upload("STOR block.bin", payload, method=method)
+                self.assertEqual((self.root / "block.bin").read_bytes(), payload)
+                downloaded, _ = self.block_download("RETR block.bin", data)
+                self.assertEqual(downloaded, payload)
+                self.block_upload("APPE block.bin", b"tail", data)
+                self.block_upload("APPE block.bin", b"", data)
+                downloaded, _ = self.block_download("RETR block.bin", data)
+                self.assertEqual(downloaded, payload + b"tail")
+                self.block_upload("STOR block.bin", b"new", data)
+                self.assertEqual((self.root / "block.bin").read_bytes(), b"new")
+                self.block_upload("STOR block.bin", b"", data)
+                downloaded, _ = self.block_download("RETR block.bin", data)
+                self.assertEqual(downloaded, b"")
+                data.close()
+
+    def test_block_listings_and_resume(self):
+        self.block_mode()
+        # Start with a listing's smaller buffer, then grow it for file I/O.
+        listing, data = self.block_download("NLST")
+        self.assertEqual(set(listing.splitlines()) - {b".", b".."}, set())
+        self.block_upload("STOR block.bin", b"0123456789", data)
+        self.block_upload("STOR block.bin", b"abc", data, rest=5)
+        self.assertEqual((self.root / "block.bin").read_bytes(), b"01234abc")
+        downloaded, _ = self.block_download("RETR block.bin", data, rest=5)
+        self.assertEqual(downloaded, b"abc")
+        self.block_upload("APPE block.bin", b"tail", data, rest=2)
+        downloaded, _ = self.block_download("RETR block.bin", data)
+        self.assertEqual(downloaded, b"01234abctail")
+        for command in ("LIST", "NLST", "MLSD"):
+            listing, _ = self.block_download(command, data)
+            self.assertIn(b"block.bin\r\n", listing)
+        with self.assertRaises(ftplib.error_perm):
+            self.ftp.sendcmd("RETR missing.bin")
+        downloaded, _ = self.block_download("RETR block.bin", data, rest=12)
+        self.assertEqual(downloaded, b"")
+
+    def test_block_large_listing(self):
+        self.block_mode()
+        names = {f"{i:04d}-" + "x" * 180 for i in range(400)}
+        for name in names:
+            (self.root / name).touch()
+        listing, _ = self.block_download("NLST")
+        self.assertGreater(len(listing), 65535)
+        self.assertEqual(set(listing.decode().splitlines()) - {".", ".."}, names)
+
+    def test_block_fragmented_headers_and_restart_markers(self):
+        self.block_mode()
+        data = self.block_start("STOR flags.bin")
+        frames = [
+            self.block(), self.block(b"checkpoint", 0x10),
+            self.block(b"record", 0x80), self.block(b"suspect", 0x20),
+            self.block(b"ignored" * 9000, 0x10), self.block(b"final", 0xc0),
+        ]
+        for frame in frames:
+            for byte in frame[:3]:
+                data.sendall(bytes([byte]))
+                time.sleep(0.005)
+            data.sendall(frame[3:])
+        self.assertTrue(self.ftp.voidresp().startswith("250"))
+        self.assertEqual((self.root / "flags.bin").read_bytes(), b"recordsuspectfinal")
+        self.block_start("STOR marker-eof.bin", data)
+        data.sendall(self.block(b"metadata", 0x50))
+        self.assertTrue(self.ftp.voidresp().startswith("250"))
+        self.assertEqual((self.root / "marker-eof.bin").read_bytes(), b"")
+        self.block_upload("STOR after.bin", b"healthy", data)
+
+    def test_block_many_blocks_per_read(self):
+        # Several blocks arrive in one socket read and are written in large chunks.
+        self.block_mode()
+        payload = os.urandom(3 * 1024 * 1024 + 123)
+        sizes = [1, 3, 65535, 2, 40000, 65535, 7]
+        wire, offset, i = bytearray(), 0, 0
+        while offset < len(payload):
+            size = sizes[i % len(sizes)]
+            wire += self.block(payload[offset:offset + size])
+            if i == 5:
+                wire += self.block(b"marker", 0x10)
+            offset += size
+            i += 1
+        data = self.block_start("STOR many.bin")
+        data.sendall(bytes(wire) + self.block(descriptor=0x40))
+        self.assertTrue(self.ftp.voidresp().startswith("250"))
+        self.assertEqual((self.root / "many.bin").read_bytes(), payload)
+
+        # A connection lost mid-block keeps every payload byte that arrived.
+        data = self.block_start("STOR cut.bin", data)
+        data.sendall(self.block(payload[:65535]) + self.block(payload[65535:131070])[:1000])
+        data.shutdown(socket.SHUT_WR)
+        with self.assertRaises(ftplib.error_temp):
+            self.ftp.voidresp()
+        self.assertEqual((self.root / "cut.bin").read_bytes(), payload[:65535 + 997])
+
+    def test_block_eof_does_not_consume_next_transfer(self):
+        self.block_mode()
+        data = self.block_start("STOR first.bin")
+        data.sendall(self.block(b"first", 0x40) + self.block(b"second", 0x40))
+        self.assertTrue(self.ftp.voidresp().startswith("250"))
+        self.block_start("STOR second.bin", data)
+        self.assertTrue(self.ftp.voidresp().startswith("250"))
+        self.assertEqual((self.root / "first.bin").read_bytes(), b"first")
+        self.assertEqual((self.root / "second.bin").read_bytes(), b"second")
+
+    def test_block_truncated_uploads_are_rejected(self):
+        self.block_mode()
+        for wire in (b"", b"\0", b"\0\0", b"\0\0\5abc", b"\0\0\3abc"):
+            with self.subTest(wire=wire):
+                data = self.block_start("STOR truncated.bin")
+                data.sendall(wire)
+                data.shutdown(socket.SHUT_WR)
+                with self.assertRaises(ftplib.error_temp) as error:
+                    self.ftp.voidresp()
+                self.assertTrue(str(error.exception).startswith("426"))
+                self.assertEqual(data.recv(1), b"")
+                self.ftp.voidcmd("NOOP")
+        self.block_upload("STOR recovered.bin", b"healthy")
+        self.assertEqual((self.root / "recovered.bin").read_bytes(), b"healthy")
+
+    def test_block_invalid_descriptors_are_rejected(self):
+        self.block_mode()
+        for descriptor in (0x01, 0x08, 0xff):
+            with self.subTest(descriptor=descriptor):
+                data = self.block_start("STOR invalid.bin")
+                data.sendall(self.block(descriptor=descriptor))
+                with self.assertRaises(ftplib.error_temp) as error:
+                    self.ftp.voidresp()
+                self.assertTrue(str(error.exception).startswith("426"))
+                self.assertEqual(data.recv(1), b"")
+                self.ftp.voidcmd("NOOP")
+        self.block_upload("STOR recovered.bin", b"healthy")
+
+    def test_block_closed_idle_connection(self):
+        self.block_mode()
+        data = self.block_upload("STOR idle.bin", b"keep")
+        data.shutdown(socket.SHUT_WR)
+        with self.assertRaises(ftplib.error_temp) as error:
+            self.ftp.sendcmd("STOR idle.bin")
+        self.assertTrue(str(error.exception).startswith("425"))
+        self.assertEqual((self.root / "idle.bin").read_bytes(), b"keep")
+        self.block_upload("STOR idle.bin", b"new")
+        self.assertEqual((self.root / "idle.bin").read_bytes(), b"new")
+
+    def test_block_mode_changes_and_abort(self):
+        self.block_mode()
+        data = self.block_upload("STOR mode.bin", b"block")
+        self.ftp.voidcmd("MODE b")
+        for command in ("MODE", "MODE BS", "MODE S extra", "MODE C"):
+            with self.assertRaises(ftplib.error_perm):
+                self.ftp.sendcmd(command)
+        downloaded, _ = self.block_download("RETR mode.bin", data)
+        self.assertEqual(downloaded, b"block")
+        self.ftp.voidcmd("MODE S")
+        self.assertEqual(data.recv(1), b"")
+        self.ftp.storbinary("STOR mode.bin", io.BytesIO(b"stream"))
+        self.assertEqual(self.download("mode.bin"), b"stream")
+        self.block_mode()
+        data = self.block_upload("STOR mode.bin", b"block again")
+        self.assertTrue(self.ftp.sendcmd("ABOR").startswith("225"))
+        self.assertEqual(data.recv(1), b"")
+        with self.assertRaises(ftplib.error_temp):
+            self.ftp.sendcmd("RETR mode.bin")
+        self.block_upload("APPE mode.bin", b"tail")
+        self.assertEqual((self.root / "mode.bin").read_bytes(), b"block againtail")
+
+    @unittest.skipUnless(os.environ.get("FTP_MODE_B_CURL"), "Set FTP_MODE_B_CURL to the curl fork")
+    def test_block_curl_interoperability(self):
+        payload = bytes(range(256)) * 9000
+        (self.root / "source.bin").write_bytes(payload)
+        base = f"ftp://127.0.0.1:{self.port}/{str(self.root).lstrip('/')}/"
+        for epsv in (True, False):
+            with self.subTest(epsv=epsv):
+                commands = [
+                    ["-T", str(self.root / "source.bin"), base + "curl.bin"],
+                    [base + "curl.bin", "-o", str(self.root / "download.bin")],
+                    [base, "-l", "-o", str(self.root / "listing.txt")],
+                    ["-T", str(self.root / "source.bin"), "--append", base + "curl.bin"],
+                    [base + "curl.bin", "-o", str(self.root / "appended.bin")],
+                ]
+                args = [os.environ["FTP_MODE_B_CURL"], "-q", "--fail-early"]
+                for index, command in enumerate(commands):
+                    if index:
+                        args += ["--next"]
+                    args += ["--ftp-block-mode", "--verbose", "--fail", "--max-time", "15"]
+                    args += ["--noproxy", "*"]
+                    if not epsv:
+                        args += ["--disable-epsv"]
+                    args += command
+                result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        timeout=90, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.root / "download.bin").read_bytes(), payload)
+                self.assertEqual((self.root / "appended.bin").read_bytes(), payload * 2)
+                self.assertIn("curl.bin", (self.root / "listing.txt").read_text().splitlines())
+                log = result.stderr.splitlines()
+                self.assertFalse(any(re.match(r"> (EPRT|PORT)\b", line) for line in log))
+                setup = [line for line in log if re.match(r"> (EPSV|PASV)\b", line)]
+                self.assertEqual(len(setup), 1, result.stderr)
+                self.assertTrue(setup[0].startswith("> EPSV" if epsv else "> PASV"))
+                self.assertEqual(sum(line.startswith("> MODE B") for line in log), 1)
+                self.assertEqual(sum(line.startswith("< 125 ") for line in log), 4)
+                self.assertEqual(sum(line.startswith("< 250 Transfer complete") for line in log), 5)
 
 
 if __name__ == "__main__":

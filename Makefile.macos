@@ -1,0 +1,41 @@
+BIN := ftpsrv-macos
+
+VERSION_TAG := $(shell git describe --abbrev=6 --dirty --always --tags)
+CFLAGS := -Wall -Werror -DVERSION_TAG=\"$(VERSION_TAG)\" -I. -pthread -O2
+SOURCE := srv.c cmd.c notify.c io.c self.c sha256.c
+# These entry points and platform stubs also work on macOS.
+SOURCE += main-linux.c cmd-linux.c self-linux.c io-macos.c
+HEADERS := $(wildcard *.h)
+TEST_SOURCE := $(filter-out main-linux.c,$(SOURCE))
+SOCKET_OBJECTS := $(patsubst %.c,.build/macos/socket/%.o,$(TEST_SOURCE))
+
+.PHONY: all clean test check
+
+all: $(BIN)
+
+$(BIN): $(SOURCE) $(HEADERS) Makefile.macos
+	$(CC) $(CFLAGS) -o $@ $(SOURCE)
+
+.build/macos/test-control: test/test-control.c $(TEST_SOURCE) $(HEADERS) Makefile.macos
+	@mkdir -p .build/macos
+	$(CC) $(CFLAGS) -o $@ test/test-control.c $(TEST_SOURCE)
+
+# Apple's linker has no GNU --wrap; redirect only the test build's calls.
+.build/macos/socket/%.o: %.c $(HEADERS) test/socket-wrap.h Makefile.macos
+	@mkdir -p .build/macos/socket
+	$(CC) $(CFLAGS) -include test/socket-wrap.h -c -o $@ $<
+
+.build/macos/test-sockets: test/test-sockets.c test/socket-wrap.h $(SOCKET_OBJECTS) Makefile.macos
+	$(CC) $(CFLAGS) -o $@ test/test-sockets.c $(SOCKET_OBJECTS)
+
+check: $(BIN) .build/macos/test-control .build/macos/test-sockets
+	./.build/macos/test-control
+	./.build/macos/test-sockets
+	python3 test/test-transfers.py ./$(BIN)
+
+clean:
+	rm -f $(BIN)
+	rm -rf .build/macos
+
+test: $(BIN)
+	./$(BIN)

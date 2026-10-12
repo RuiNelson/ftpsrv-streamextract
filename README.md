@@ -5,6 +5,26 @@ The FTP server accepts connection on port 2121.
 
 ## Features
 Client software that has been tested include gFTP, Filezilla, curl, and Thunar.
+FTP block mode (`MODE B`, [RFC 959 section 3.4.2][ftp-rfc]) is supported for
+downloads, uploads, appends, directory listings, and the PS5 virtual `/proc`
+transfers. Blocks use a three-byte header and at most 65535 payload bytes;
+an explicit EOF block ends each transfer without closing the data connection.
+Successful transfers return `250`, and the next transfer reuses the connection
+with `125`, using passive data connections. `MODE S` selects the default
+stream mode again. Changing mode, configuring a new data endpoint, or sending
+`ABOR` closes the previous data connection.
+
+Use the curl fork's `--ftp-block-mode` option to select block mode, for example:
+
+```console
+curl --ftp-block-mode ftp://ps5:2121/path/file -o file
+```
+
+Uploads reject truncated block headers/payloads, invalid descriptor bits, and
+connection closure without EOF with `426`. Restart-marker blocks are skipped
+as metadata; the existing numeric `REST` offsets remain supported for binary
+file transfers. Only file structure (`STRU F`) is supported.
+
 The payload supports a couple of custom SITE commands specifically for the
 PS4 and PS5 (executed without prepending SITE). In particular:
  - KILL - kill the FTP server.
@@ -83,6 +103,47 @@ Run local regression checks (requires Python 3) with
 `make -f Makefile.linux check`. The checks launch their own server on a temporary
 port and use temporary directories for all file transfers.
 
+## Building for macOS
+
+Build and run the native server with the Xcode Command Line Tools:
+
+```console
+make -f Makefile.macos
+./ftpsrv-macos -p 2121
+```
+
+Run the same regression checks on macOS with `make -f Makefile.macos check`
+(requires Python 3). To also test block-mode interoperability and verify that
+the curl fork reuses one data connection across uploads, downloads, and listings,
+set `FTP_MODE_B_CURL` to its compiled executable:
+
+```console
+FTP_MODE_B_CURL=/path/to/curl make -f Makefile.macos check
+```
+
+Compare sequential passive FTP transfers of 1000 files of 4 KiB with and
+without block mode (three repetitions, with SHA-256 verification):
+
+```console
+python3 test/benchmark-small-files.py --server ./ftpsrv-macos --curl /path/to/curl
+```
+
+The benchmark and block-mode interoperability checks use only PASV/EPSV.
+
+To benchmark an existing anonymous FTP server, provide its host, port, and an
+existing absolute test directory instead of `--server`:
+
+```console
+python3 test/benchmark-small-files.py --host 192.168.1.5 --port 2121 \
+  --remote-dir /data/modeb --curl /path/to/curl
+```
+
+Remote runs use an exclusive subdirectory, verify uploads by reading them back
+in the measured downloads, and remove only the files and directories they create.
+
+The macOS build reuses the POSIX platform stubs; SELF decryption of encrypted
+console segments requires the corresponding console payload.
+
 Socket buffers are requested before connection establishment and verified with
 `getsockopt`. If the OS rejects a buffer size request, the server logs the error
 and uses the current buffer if it is valid. Define `FTP_DEBUG_SOCKET_BUFFERS`
@@ -105,3 +166,4 @@ ftpsrv is licensed under the GPLv3+.
 [sdk-ps4]: https://github.com/ps4-payload-dev/sdk
 [sdk-ps5]: https://github.com/ps5-payload-dev/sdk
 [issues]: https://github.com/ps5-payload-dev/ftpsrv/issues/new
+[ftp-rfc]: https://www.rfc-editor.org/rfc/rfc959.html#section-3.4.2

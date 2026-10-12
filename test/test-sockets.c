@@ -11,13 +11,19 @@
 
 /* Linker wrappers exercise real loopback sockets, check setup order, and
  * inject option failures without changing production code. */
-int __real_socket(int, int, int);
-int __real_accept(int, struct sockaddr *, socklen_t *);
-int __real_connect(int, const struct sockaddr *, socklen_t);
-int __real_listen(int, int);
-int __real_setsockopt(int, int, int, const void *, socklen_t);
-int __real_getsockopt(int, int, int, void *, socklen_t *);
-int __real_close(int);
+#ifdef __APPLE__
+#define REAL_SYMBOL(name) __asm("_" name)
+#include "socket-wrap.h"
+#else
+#define REAL_SYMBOL(name)
+#endif
+int __real_socket(int, int, int) REAL_SYMBOL("socket");
+int __real_accept(int, struct sockaddr *, socklen_t *) REAL_SYMBOL("accept");
+int __real_connect(int, const struct sockaddr *, socklen_t) REAL_SYMBOL("connect");
+int __real_listen(int, int) REAL_SYMBOL("listen");
+int __real_setsockopt(int, int, int, const void *, socklen_t) REAL_SYMBOL("setsockopt");
+int __real_getsockopt(int, int, int, void *, socklen_t *) REAL_SYMBOL("getsockopt");
+int __real_close(int) REAL_SYMBOL("close");
 
 static struct {
   int send_set, recv_set, send_read, recv_read, send_timeout, recv_timeout;

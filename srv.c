@@ -335,6 +335,16 @@ ftp_thread(void *args) {
   env.active_fd   = (int)(long)args;
 
   env.type        = 'I';
+  env.mode        = 'S';
+  env.data_connected = 0;
+  env.block_remaining = 0;
+  env.block_descriptor = 0;
+  env.block_eof = 0;
+  env.block_header_len = 0;
+  env.block_err = 0;
+  env.block_rbuf = NULL;
+  env.block_rbuf_off = 0;
+  env.block_rbuf_len = 0;
   env.data_offset = 0;
   env.data_offset_is_rest = 0;
   env.self2elf    = 0;
@@ -413,6 +423,10 @@ ftp_thread(void *args) {
 
   if(env.xfer_buf) {
     free(env.xfer_buf);
+  }
+
+  if(env.block_rbuf) {
+    free(env.block_rbuf);
   }
 
   pthread_mutex_destroy(&env.copy_mutex);
