@@ -59,6 +59,12 @@ int ftp_mc_configure(unsigned max_conn, uint32_t max_stripe);
 unsigned ftp_mc_max_conn(void);
 
 /**
+ * Minimum ring size and buffer budget of a transfer, in octets.
+ **/
+size_t ftp_mc_ring_size(void);
+size_t ftp_mc_buffer_budget(void);
+
+/**
  * Commands: OPTS MC (arg is the text after "MC"), MPSV and MPRT.
  **/
 int ftp_mc_opts(ftp_env_t *env, const char *arg);

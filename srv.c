@@ -310,8 +310,11 @@ ftp_greet(ftp_env_t *env) {
   snprintf(msg, sizeof(msg),
            "220-Welcome to ftpsrv.elf running on pid %d\r\n"
            "220-Version: %s (built %s %s)\r\n"
+           "220-FTPMC: up to %u connections, ring %zu KiB, "
+           "buffers %zu KiB\r\n"
            "220 Service is ready\r\n",
-           getpid(), VERSION_TAG, __DATE__, __TIME__);
+           getpid(), VERSION_TAG, __DATE__, __TIME__, ftp_mc_max_conn(),
+           ftp_mc_ring_size() / 1024, ftp_mc_buffer_budget() / 1024);
 
   len = strlen(msg);
   if(io_nwrite(env->active_fd, msg, len)) {

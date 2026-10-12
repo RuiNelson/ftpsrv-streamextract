@@ -172,6 +172,16 @@ ftp_mc_max_conn(void) {
   return mc_max_conn;
 }
 
+size_t
+ftp_mc_ring_size(void) {
+  return FTP_MC_RING_SIZE;
+}
+
+size_t
+ftp_mc_buffer_budget(void) {
+  return FTP_MC_BUFFER_BUDGET;
+}
+
 int
 ftp_mc_has_set(const ftp_env_t *env) {
   return env->mc && env->mc->kind != MC_NONE;

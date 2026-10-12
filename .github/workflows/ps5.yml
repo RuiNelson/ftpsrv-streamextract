@@ -36,6 +36,9 @@ jobs:
     - name: Build Payload
       run: |
         make -f Makefile.ps5 clean all
+        # FTPMC variant with a 4 MiB ring, to compare with the default 1 MiB.
+        make -f Makefile.ps5 ELF=ftpsrv-ps5-ring4m.elf \
+          EXTRA_CFLAGS=-DFTP_MC_RING_SIZE=4194304 all
 
     - name: Upload Payload
       uses: actions/upload-artifact@v4
@@ -43,6 +46,7 @@ jobs:
         name: Payload
         path: |
           ftpsrv-ps5.elf
+          ftpsrv-ps5-ring4m.elf
         if-no-files-found: error
 
   release:

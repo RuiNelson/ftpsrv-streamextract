@@ -20,6 +20,8 @@ VERSION_TAG := $(shell git describe --abbrev=6 --dirty --always --tags)
 
 CFLAGS := -Wall -Werror -DVERSION_TAG=\"$(VERSION_TAG)\" -I. -pthread
 CFLAGS += -O2
+# Extra defines for build variants, e.g. EXTRA_CFLAGS=-DFTP_MC_RING_SIZE=4194304
+CFLAGS += $(EXTRA_CFLAGS)
 SOURCE := srv.c cmd.c mc.c notify.c io.c self.c sha256.c
 SOURCE += main-linux.c cmd-linux.c self-linux.c
 SOURCE += io-linux.c

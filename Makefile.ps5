@@ -30,6 +30,8 @@ ELF_STRIP := $(firstword $(wildcard $(PS5_PAYLOAD_SDK)/bin/prospero-llvm-strip) 
 VERSION_TAG := $(shell git describe --abbrev=6 --dirty --always --tags)
 
 CFLAGS := $(CFLAGS) -Wall -Werror -DVERSION_TAG=\"$(VERSION_TAG)\" -I. -O3 -DNDEBUG -march=znver2 -mtune=znver2 -flto
+# Extra defines for build variants, e.g. EXTRA_CFLAGS=-DFTP_MC_RING_SIZE=4194304
+CFLAGS += $(EXTRA_CFLAGS)
 SOURCE := srv.c cmd.c mc.c cmd-proc.c notify.c io.c self.c sha256.c
 SOURCE += main-prospero.c cmd-prospero.c self-prospero.c
 SOURCE += io-freebsd.c
