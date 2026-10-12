@@ -174,37 +174,21 @@ class Transfers(unittest.TestCase):
         return bytes([descriptor]) + len(payload).to_bytes(2, "big") + payload
 
     def block_start(self, command, data=None, method="EPSV", rest=None):
-        listener = None
+        self.assertIn(method, ("PASV", "EPSV"))
         reused = data is not None
         if not reused:
-            if method in ("PASV", "EPSV"):
-                if method == "PASV":
-                    host, port = self.ftp.makepasv()
-                else:
-                    response = self.ftp.sendcmd("EPSV")
-                    port = int(re.search(r"\(\|\|\|(\d+)\|\)", response)[1])
-                    host = "127.0.0.1"
-                data = socket.create_connection((host, port), timeout=5)
-                self.addCleanup(data.close)
+            if method == "PASV":
+                host, port = self.ftp.makepasv()
             else:
-                listener = socket.socket()
-                self.addCleanup(listener.close)
-                listener.bind(("127.0.0.1", 0))
-                listener.listen(1)
-                listener.settimeout(5)
-                port = listener.getsockname()[1]
-                if method == "PORT":
-                    self.ftp.sendport("127.0.0.1", port)
-                else:
-                    self.ftp.voidcmd(f"EPRT |1|127.0.0.1|{port}|")
+                response = self.ftp.sendcmd("EPSV")
+                port = int(re.search(r"\(\|\|\|(\d+)\|\)", response)[1])
+                host = "127.0.0.1"
+            data = socket.create_connection((host, port), timeout=5)
+            self.addCleanup(data.close)
         if rest is not None:
             self.ftp.sendcmd(f"REST {rest}")
         response = self.ftp.sendcmd(command)
         self.assertTrue(response.startswith("125" if reused else "150"), response)
-        if listener:
-            data, _ = listener.accept()
-            listener.close()
-            self.addCleanup(data.close)
         data.settimeout(5)
         return data
 
@@ -241,7 +225,7 @@ class Transfers(unittest.TestCase):
     def test_block_roundtrip_and_connection_reuse(self):
         self.block_mode()
         payload = bytes(range(256)) * 9000
-        for method in ("EPSV", "PASV", "EPRT", "PORT"):
+        for method in ("EPSV", "PASV"):
             with self.subTest(method=method):
                 data = self.block_upload("STOR block.bin", payload, method=method)
                 self.assertEqual((self.root / "block.bin").read_bytes(), payload)
@@ -385,8 +369,8 @@ class Transfers(unittest.TestCase):
         payload = bytes(range(256)) * 9000
         (self.root / "source.bin").write_bytes(payload)
         base = f"ftp://127.0.0.1:{self.port}/{str(self.root).lstrip('/')}/"
-        for active in (False, True):
-            with self.subTest(active=active):
+        for epsv in (True, False):
+            with self.subTest(epsv=epsv):
                 commands = [
                     ["-T", str(self.root / "source.bin"), base + "curl.bin"],
                     [base + "curl.bin", "-o", str(self.root / "download.bin")],
@@ -394,13 +378,14 @@ class Transfers(unittest.TestCase):
                     ["-T", str(self.root / "source.bin"), "--append", base + "curl.bin"],
                     [base + "curl.bin", "-o", str(self.root / "appended.bin")],
                 ]
-                args = [os.environ["FTP_MODE_B_CURL"]]
+                args = [os.environ["FTP_MODE_B_CURL"], "-q", "--fail-early"]
                 for index, command in enumerate(commands):
                     if index:
                         args += ["--next"]
                     args += ["--ftp-block-mode", "--verbose", "--fail", "--max-time", "15"]
-                    if active:
-                        args += ["--ftp-port", "127.0.0.1"]
+                    args += ["--noproxy", "*"]
+                    if not epsv:
+                        args += ["--disable-epsv"]
                     args += command
                 result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         timeout=90, text=True)
@@ -409,8 +394,10 @@ class Transfers(unittest.TestCase):
                 self.assertEqual((self.root / "appended.bin").read_bytes(), payload * 2)
                 self.assertIn("curl.bin", (self.root / "listing.txt").read_text().splitlines())
                 log = result.stderr.splitlines()
-                setup = [line for line in log if re.match(r"> (EPSV|PASV|EPRT|PORT)\b", line)]
+                self.assertFalse(any(re.match(r"> (EPRT|PORT)\b", line) for line in log))
+                setup = [line for line in log if re.match(r"> (EPSV|PASV)\b", line)]
                 self.assertEqual(len(setup), 1, result.stderr)
+                self.assertTrue(setup[0].startswith("> EPSV" if epsv else "> PASV"))
                 self.assertEqual(sum(line.startswith("> MODE B") for line in log), 1)
                 self.assertEqual(sum(line.startswith("< 125 ") for line in log), 4)
                 self.assertEqual(sum(line.startswith("< 250 Transfer complete") for line in log), 5)

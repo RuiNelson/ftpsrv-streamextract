@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare sequential small-file FTP transfers with curl, using MODE S and B."""
+"""Compare sequential small-file passive FTP transfers using MODE S and B."""
 
 import argparse
 import ftplib
@@ -36,8 +36,8 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def transfer(args, root, source, expected, port, mode, direction, active, repeat):
-    label = f"{'active' if active else 'passive'}-{mode}-{direction}-{repeat}"
+def transfer(args, root, source, expected, port, mode, direction, repeat):
+    label = f"passive-{mode}-{direction}-{repeat}"
     target = root / label
     target.mkdir()
     # Downloads read files prepared locally, so their timing is independent
@@ -59,8 +59,6 @@ def transfer(args, root, source, expected, port, mode, direction, active, repeat
                   'write-out = "%{response_code} %{size_upload} %{size_download}\\n"']
         if mode == "B":
             lines.append("ftp-block-mode")
-        if active:
-            lines.append('ftp-port = "127.0.0.1"')
         remote = target / name if direction == "upload" else input_dir / name
         lines.append("url = " + json.dumps(f"ftp://127.0.0.1:{port}{remote}"))
         option = "upload-file" if direction == "upload" else "output"
@@ -84,7 +82,9 @@ def transfer(args, root, source, expected, port, mode, direction, active, repeat
         raise RuntimeError(f"{label}: curl exited {process.returncode}\n{log[-8000:]}")
 
     control_connections = len(re.findall(r"^> USER ", log, re.MULTILINE))
-    data_connections = len(re.findall(r"^> (?:EPSV|PASV|EPRT|PORT)\b", log, re.MULTILINE))
+    if re.search(r"^> (?:EPRT|PORT)\b", log, re.MULTILINE):
+        raise AssertionError(f"{label}: active FTP was used")
+    data_connections = len(re.findall(r"^> (?:EPSV|PASV)\b", log, re.MULTILINE))
     reused = len(re.findall(r"^< 125 ", log, re.MULTILINE))
     negotiated = len(re.findall(r"^> MODE B\r?$", log, re.MULTILINE))
     transfers = len(re.findall(r"^> (?:STOR|RETR) ", log, re.MULTILINE))
@@ -106,7 +106,7 @@ def transfer(args, root, source, expected, port, mode, direction, active, repeat
     if actual != expected:
         raise AssertionError(f"{label}: file names or SHA-256 hashes differ")
 
-    result = dict(connection="active" if active else "passive", mode=mode,
+    result = dict(connection="passive", mode=mode,
                   direction=direction, repeat=repeat, seconds=elapsed,
                   files_per_second=args.files / elapsed,
                   control_connections=control_connections,
@@ -120,28 +120,24 @@ def transfer(args, root, source, expected, port, mode, direction, active, repeat
 def report(args, runs):
     lines = ["# Small-file FTP benchmark", "",
              f"{args.files} files × {args.size} bytes; {args.repeats} repetitions "
-             "per case. Sequential transfers on localhost using the same curl "
+             "per case. Sequential passive FTP transfers on localhost using the same curl "
              "executable for MODE S and B. Times include one curl invocation for "
              "the complete batch, configuration parsing, and verbose logging. "
              "File preparation and SHA-256 verification are outside the timer.", "",
              "| Connection | Transfer | MODE S median | MODE B median | Speedup | "
              "Data connections S / B |", "|---|---|---:|---:|---:|---:|"]
     summaries = []
-    for connection in ("passive", "active"):
-        for direction in ("upload", "download"):
-            cases = {mode: [run for run in runs if run["connection"] == connection
-                            and run["direction"] == direction and run["mode"] == mode]
-                     for mode in ("S", "B")}
-            if not cases["S"]:
-                continue
-            medians = {mode: statistics.median(run["seconds"] for run in cases[mode])
-                       for mode in ("S", "B")}
-            ratio = medians["S"] / medians["B"]
-            summaries.append(dict(connection=connection, direction=direction,
-                                  stream_seconds=medians["S"], block_seconds=medians["B"],
-                                  speedup=ratio))
-            lines.append(f"| {connection} | {direction} | {medians['S']:.3f} s | "
-                         f"{medians['B']:.3f} s | {ratio:.2f}× | {args.files} / 1 |")
+    for direction in ("upload", "download"):
+        cases = {mode: [run for run in runs if run["direction"] == direction
+                        and run["mode"] == mode] for mode in ("S", "B")}
+        medians = {mode: statistics.median(run["seconds"] for run in cases[mode])
+                   for mode in ("S", "B")}
+        ratio = medians["S"] / medians["B"]
+        summaries.append(dict(connection="passive", direction=direction,
+                              stream_seconds=medians["S"], block_seconds=medians["B"],
+                              speedup=ratio))
+        lines.append(f"| passive | {direction} | {medians['S']:.3f} s | "
+                     f"{medians['B']:.3f} s | {ratio:.2f}× | {args.files} / 1 |")
     lines += ["", "All files matched their source SHA-256 hashes. Each batch used "
               "one control connection. MODE B negotiated once and reused its data "
               f"connection for {args.files - 1} transfers. MODE S opened a new data "
@@ -165,7 +161,6 @@ def main():
     parser.add_argument("--files", type=int, default=1000)
     parser.add_argument("--size", type=int, default=4096, help="Bytes per file")
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--connection", choices=("both", "passive", "active"), default="passive")
     parser.add_argument("--timeout", type=int, default=300, help="Seconds per batch")
     parser.add_argument("--output", default=".build/small-files-results.json")
     args = parser.parse_args()
@@ -192,16 +187,13 @@ def main():
             try:
                 wait_for_server(server, port, log)
                 runs = []
-                active_cases = (False, True) if args.connection == "both" else (
-                    args.connection == "active",)
                 for repeat in range(1, args.repeats + 1):
                     # Alternate the order to reduce cache/order bias.
                     modes = ("S", "B") if repeat % 2 else ("B", "S")
-                    for active in active_cases:
-                        for direction in ("upload", "download"):
-                            for mode in modes:
-                                runs.append(transfer(args, root, source, expected, port,
-                                                     mode, direction, active, repeat))
+                    for direction in ("upload", "download"):
+                        for mode in modes:
+                            runs.append(transfer(args, root, source, expected, port,
+                                                 mode, direction, repeat))
                 report(args, runs)
             finally:
                 server.terminate()

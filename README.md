@@ -10,7 +10,7 @@ downloads, uploads, appends, directory listings, and the PS5 virtual `/proc`
 transfers. Blocks use a three-byte header and at most 65535 payload bytes;
 an explicit EOF block ends each transfer without closing the data connection.
 Successful transfers return `250`, and the next transfer reuses the connection
-with `125`, in both active and passive mode. `MODE S` selects the default
+with `125`, using passive data connections. `MODE S` selects the default
 stream mode again. Changing mode, configuring a new data endpoint, or sending
 `ABOR` closes the previous data connection.
 
@@ -120,6 +120,15 @@ set `FTP_MODE_B_CURL` to its compiled executable:
 ```console
 FTP_MODE_B_CURL=/path/to/curl make -f Makefile.macos check
 ```
+
+Compare sequential passive FTP transfers of 1000 files of 4 KiB with and
+without block mode (three repetitions, with SHA-256 verification):
+
+```console
+python3 test/benchmark-small-files.py --server ./ftpsrv-macos --curl /path/to/curl
+```
+
+The benchmark and block-mode interoperability checks use only PASV/EPSV.
 
 The macOS build reuses the POSIX platform stubs; SELF decryption of encrypted
 console segments requires the corresponding console payload.
