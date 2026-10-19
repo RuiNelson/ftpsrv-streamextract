@@ -147,51 +147,15 @@ Run local regression checks (requires Python 3) with
 port and use temporary directories for all file transfers.
 
 ## Building for macOS
-
-Build and run the native server with the Xcode Command Line Tools:
-
+Assuming you have the Xcode Command Line Tools installed, the FTP server can be
+compiled using the following command:
 ```console
-make -f Makefile.macos
-./ftpsrv-macos -p 2121
+john@localhost:ftpsrv$ make -f Makefile.macos
 ```
 
-Run the same regression checks on macOS with `make -f Makefile.macos check`
-(requires Python 3). To also test block-mode interoperability and verify that
-the curl fork reuses one data connection across uploads, downloads, and listings,
-set `FTP_MODE_B_CURL` to its compiled executable:
-
-```console
-FTP_MODE_B_CURL=/path/to/curl make -f Makefile.macos check
-```
-
-Compare sequential passive FTP transfers of 1000 files of 4 KiB with and
-without block mode (three repetitions, with SHA-256 verification):
-
-```console
-python3 test/benchmark-small-files.py --server ./ftpsrv-macos --curl /path/to/curl
-```
-
-The benchmark and block-mode interoperability checks use only PASV/EPSV.
-
-To benchmark an existing anonymous FTP server, provide its host, port, and an
-existing absolute test directory instead of `--server`:
-
-```console
-python3 test/benchmark-small-files.py --host 192.168.1.5 --port 2121 \
-  --remote-dir /data/modeb --curl /path/to/curl
-```
-
-Remote runs use an exclusive subdirectory, verify uploads by reading them back
-in the measured downloads, and remove only the files and directories they create.
-
-The macOS build reuses the POSIX platform stubs; SELF decryption of encrypted
-console segments requires the corresponding console payload.
-
-Socket buffers are requested before connection establishment and verified with
-`getsockopt`. If the OS rejects a buffer size request, the server logs the error
-and uses the current buffer if it is valid. Define `FTP_DEBUG_SOCKET_BUFFERS`
-when compiling to log requested and actual buffer sizes; actual values are
-reported as returned by the OS (Linux includes accounting overhead).
+Run local regression checks (requires Python 3) with
+`make -f Makefile.macos check`, optionally with `FTP_MODE_B_CURL=/path/to/curl`
+to test block-mode interoperability against the curl fork.
 
 ## Known issues
 Some PS5 firmwares below vesion 4 contains a kernel bug where reading from some SELF
