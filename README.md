@@ -38,6 +38,44 @@ Note: the SELF command operates on induvidual connections so use e.g.,
 john@localhost:ftpsrv$ curl -o libkernel.sprx -Q SELF ftp://ps5:2121/system/common/lib/libkernel.sprx
 ```
 
+## Additional commands
+These commands are implemented but were not previously documented here:
+ - DSIZ <path> - report recursive directory size (errors if path is a file).
+ - RMDA <dir> - delete a directory tree (alias: SITE RMDIR).
+ - AVBL <path> - available space in bytes for the given path.
+ - XQUOTA - report file count/limits and disk usage/limits.
+ - SITE CHMOD <mode> <path> - change permissions.
+ - SITE UMASK [mode] - get/set file creation mask.
+ - SITE SYMLINK <target> <link> - create a symlink.
+ - SITE CPFR <from> / SITE CPTO <to> - server-side copy (asynchronous).
+ - SITE COPY <from> <to> - server-side copy (asynchronous).
+ - SITE MOVE <from> <to> - server-side move (asynchronous).
+ - SITE LOWER <path> - recursively rename a file or directory tree to lowercase.
+ - SITE UPPER <path> - recursively rename a file or directory tree to uppercase.
+ - STOP / SITE STOP - stop the current copy/move/delete/case operation.
+ - SITE AUTHID <hex_authid> - set process AuthID (PS5 only).
+
+On PS5, the server also exposes a virtual `/proc` directory in the root listing.
+`LIST /proc` shows process files with process start times and names formatted
+as `<pid>_<title-id>_<command>`, plus `_all_` for the full process table.
+`RETR /proc/_all_` shows the current process table, and `RETR /proc/<pid>` or
+`RETR /proc/<pid>_<title-id>_<command>` returns detailed process information.
+Deleting a process file, for example `DELE /proc/105_0000_ps`, sends `SIGKILL`
+to that process.
+
+Note: the copy and move commands return immediately with `250 Copy started in
+background` or `250 Move started in background`; errors during the background
+operation are not reported to the client. Only one copy, move, recursive
+delete, LOWER, or UPPER operation can run on the server at a time.
+
+The LOWER and UPPER commands also work without the SITE prefix. They rename the
+target path and every nested file, directory, and symlink name. Before changing
+anything, the server checks each directory for case-conversion name collisions
+such as `File.bin` and `file.bin`.
+
+Some clients (e.g. WinSCP) can be configured to use these extra commands
+for file management operations.
+
 ## Multiple data connections (FTPMC)
 The server implements [FTPMC][ftpmc] (draft-ftpmc-00), which carries one
 transfer over N data connections in parallel: the data stream is cut into
@@ -80,44 +118,6 @@ so a client that vanishes also frees an idle set.
 The limits can be changed with `-c CONNS` (up to 60) and `-s STRIPE` on Linux
 and macOS, or at compile time with `-DFTP_MC_MAX_CONN=8
 -DFTP_MC_MAX_STRIPE=1048576`.
-
-## Additional commands
-These commands are implemented but were not previously documented here:
- - DSIZ <path> - report recursive directory size (errors if path is a file).
- - RMDA <dir> - delete a directory tree (alias: SITE RMDIR).
- - AVBL <path> - available space in bytes for the given path.
- - XQUOTA - report file count/limits and disk usage/limits.
- - SITE CHMOD <mode> <path> - change permissions.
- - SITE UMASK [mode] - get/set file creation mask.
- - SITE SYMLINK <target> <link> - create a symlink.
- - SITE CPFR <from> / SITE CPTO <to> - server-side copy (asynchronous).
- - SITE COPY <from> <to> - server-side copy (asynchronous).
- - SITE MOVE <from> <to> - server-side move (asynchronous).
- - SITE LOWER <path> - recursively rename a file or directory tree to lowercase.
- - SITE UPPER <path> - recursively rename a file or directory tree to uppercase.
- - STOP / SITE STOP - stop the current copy/move/delete/case operation.
- - SITE AUTHID <hex_authid> - set process AuthID (PS5 only).
-
-On PS5, the server also exposes a virtual `/proc` directory in the root listing.
-`LIST /proc` shows process files with process start times and names formatted
-as `<pid>_<title-id>_<command>`, plus `_all_` for the full process table.
-`RETR /proc/_all_` shows the current process table, and `RETR /proc/<pid>` or
-`RETR /proc/<pid>_<title-id>_<command>` returns detailed process information.
-Deleting a process file, for example `DELE /proc/105_0000_ps`, sends `SIGKILL`
-to that process.
-
-Note: the copy and move commands return immediately with `250 Copy started in
-background` or `250 Move started in background`; errors during the background
-operation are not reported to the client. Only one copy, move, recursive
-delete, LOWER, or UPPER operation can run on the server at a time.
-
-The LOWER and UPPER commands also work without the SITE prefix. They rename the
-target path and every nested file, directory, and symlink name. Before changing
-anything, the server checks each directory for case-conversion name collisions
-such as `File.bin` and `file.bin`.
-
-Some clients (e.g. WinSCP) can be configured to use these extra commands
-for file management operations.
 
 ## Building for the PS4
 Assuming you have the [ps4-payload-sdk][sdk-ps4] installed on a POSIX machine,
