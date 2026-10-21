@@ -649,6 +649,110 @@ class Transfers(unittest.TestCase):
         self.mc_upload("APPE mc.bin", b"tail" * 1000, 1000)
         self.assertEqual(target.read_bytes(), data + b"tail" * 1000)
 
+    def test_mc_resume_truncates_before_receiving(self):
+        self.ftp.voidcmd("TYPE I")
+        prefix = os.urandom(12345)
+        target = self.root / "mc.bin"
+        for mode in ("S", "B"):
+            for remainder in (b"", b"short remainder"):
+                for connected in (True, False):
+                    with self.subTest(mode=mode, remainder=remainder, connected=connected):
+                        self.ftp.voidcmd("MODE " + mode)
+                        self.mc_enable(3, 4096)
+                        target.write_bytes(prefix + b"old tail" * 10000)
+                        endpoints = self.mc_passive(connect=connected)
+                        self.ftp.sendcmd(f"REST {len(prefix)}")
+                        self.ftp.putcmd("STOR mc.bin")
+                        socks = endpoints if connected else [self.mc_connect(p) for p in endpoints]
+                        self.assertTrue(self.ftp.getresp().startswith(("125", "150")))
+                        try:
+                            # No data or EOF has arrived: cleanup cannot repair the file.
+                            deadline = time.monotonic() + 2
+                            while target.stat().st_size != len(prefix) and time.monotonic() < deadline:
+                                time.sleep(0.01)
+                            self.assertEqual(target.read_bytes(), prefix)
+                        finally:
+                            self.mc_send(socks, remainder, 4096, block=mode == "B")
+                            self.assertTrue(self.ftp.voidresp().startswith("250" if mode == "B" else "226"))
+                            for sock in socks:
+                                sock.close()
+                        self.assertEqual(target.read_bytes(), prefix + remainder)
+
+    def test_mc_resumed_prefix_survives_process_exit(self):
+        source = os.urandom(2 * 1024 * 1024 + 17)
+        offset, stripe, sent = 12345, 4096, 393216
+        target = self.root / "crash.bin"
+        for mode in ("S", "B"):
+            with self.subTest(mode=mode):
+                target.write_bytes(source[:offset] + b"X" * (4 * 1024 * 1024))
+                with socket.socket() as probe:
+                    probe.bind(("127.0.0.1", 0))
+                    port = probe.getsockname()[1]
+                # Kill a separate server so no failure handler can truncate the file.
+                with subprocess.Popen([self.binary, "-p", str(port)],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as server:
+                    ftp, socks = None, []
+                    try:
+                        deadline = time.monotonic() + 10
+                        while True:
+                            ftp = ftplib.FTP(timeout=5)
+                            try:
+                                ftp.connect("127.0.0.1", port)
+                                break
+                            except OSError:
+                                ftp.close()
+                                self.assertIsNone(server.poll(), "Separate server exited")
+                                self.assertLess(time.monotonic(), deadline)
+                                time.sleep(0.02)
+                        ftp.login()
+                        ftp.cwd(str(self.root))
+                        ftp.voidcmd("TYPE I")
+                        ftp.voidcmd("MODE " + mode)
+                        ftp.voidcmd(f"OPTS MC 3 {stripe}")
+                        response = ftp.sendcmd("MPSV")
+                        ports = re.search(r"\|\|\|([\d,]+)\|", response)[1].split(",")
+                        socks = [self.mc_connect(int(p)) for p in ports]
+                        ftp.sendcmd(f"REST {offset}")
+                        self.assertTrue(ftp.sendcmd("STOR crash.bin").startswith("125"))
+
+                        def send(sock, part):
+                            if mode == "B":
+                                for pos in range(0, len(part), 65535):
+                                    sock.sendall(self.block(part[pos:pos + 65535]))
+                            else:
+                                sock.sendall(part)
+                            # Keep all connections open; the transfer is unfinished.
+
+                        self.mc_parallel(send, socks, self.mc_split(source[offset:offset + sent], 3, stripe))
+                        deadline = time.monotonic() + 5
+                        while target.read_bytes()[offset:offset + 262144] != source[offset:offset + 262144]:
+                            self.assertLess(time.monotonic(), deadline, "No file progress")
+                            time.sleep(0.01)
+                        server.kill()
+                        server.wait(timeout=5)
+                        stored = target.read_bytes()
+                        self.assertGreater(len(stored), offset)
+                        self.assertLessEqual(len(stored), offset + sent)
+                        self.assertEqual(stored, source[:len(stored)])
+                    finally:
+                        for sock in socks:
+                            sock.close()
+                        if ftp is not None:
+                            ftp.close()
+                        if server.poll() is None:
+                            server.kill()
+                        server.wait(timeout=5)
+
+                # Resume on the main server, which has no state from that upload,
+                # with another N/S and an offset that is not a stripe boundary.
+                self.ftp.voidcmd("TYPE I")
+                self.ftp.voidcmd("MODE " + mode)
+                self.mc_enable(2, 5000)
+                self.assertEqual(self.ftp.size("crash.bin"), len(stored))
+                self.mc_upload("STOR crash.bin", source[len(stored):], 5000,
+                               block=mode == "B", rest=len(stored))
+                self.assertEqual(target.read_bytes(), source)
+
     def test_mc_listings(self):
         names = {f"{i:04d}-" + "x" * 100 for i in range(300)}
         for name in names:

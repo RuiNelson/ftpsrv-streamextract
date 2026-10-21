@@ -6388,7 +6388,9 @@ ftp_store(ftp_env_t *env, const char *arg, int append) {
   }
 
   // Preserve an existing file if the data connection could not be opened.
-  if(!append && off == 0 && ftruncate(fd, 0)) {
+  // On a connection set, discard any old tail before receiving resumed data.
+  // The stored file must stay a valid prefix even if the process stops.
+  if(!append && (off == 0 || ftp_mc_xfer_active(env)) && ftruncate(fd, off)) {
     err = ftp_perror(env);
     ftp_data_close(env);
     close(fd);
