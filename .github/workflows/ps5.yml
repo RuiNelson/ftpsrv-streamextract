@@ -35,14 +35,14 @@ jobs:
 
     - name: Build Payload
       run: |
-        make -f Makefile.ps5 clean all
+        make -f Makefile.ps5 clean all ELF=ftpsrv-se-ps5.elf
 
     - name: Upload Payload
       uses: actions/upload-artifact@v4
       with:
         name: Payload
         path: |
-          ftpsrv-ps5.elf
+          ftpsrv-se-ps5.elf
         if-no-files-found: error
 
   release:
@@ -65,4 +65,4 @@ jobs:
           tag_name: ${{ github.ref_name }}
           prerelease: true
           files: |
-            ftpsrv-ps5.elf
+            ftpsrv-se-ps5.elf
