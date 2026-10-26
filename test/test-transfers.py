@@ -106,6 +106,83 @@ class Transfers(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"01234abc")
         self.assertEqual(self.download("data.bin", rest=5), b"abc")
 
+    def test_pwrite_preserves_file_and_session_state(self):
+        self.assertIn("SITE PWRITE", self.ftp.sendcmd("FEAT"))
+        name = 'game "quoted" \\ file.pkg'
+        quoted = '"' + name.replace('\\', '\\\\').replace('"', '\\"') + '"'
+        target = self.root / name
+        original = bytes(range(256)) * 12
+        target.write_bytes(original)
+        self.ftp.sendcmd("REST 7")
+        for offset, patch in ((0, b'\x00\xff\r\n'), (100, bytes(range(256)) * 4),
+                              (len(original) - 2, b'EN')):
+            self.assertEqual(self.ftp.sendcmd(
+                f"SITE PWRITE {quoted} {offset} {patch.hex().upper()}"),
+                "250 PWRITE OK")
+            original = original[:offset] + patch + original[offset + len(patch):]
+            self.assertEqual(target.read_bytes(), original)
+        # PWRITE does not consume the separate transfer restart marker.
+        target2 = self.root / 'resumed.bin'
+        target2.write_bytes(b'0123456789')
+        with self.ftp.transfercmd("STOR resumed.bin") as conn:
+            conn.sendall(b'x')
+        self.ftp.voidresp()
+        self.assertEqual(target2.read_bytes(), b'0123456x')
+        self.assertTrue(self.ftp.sendcmd("NOOP").startswith("200"))
+
+    def test_pwrite_rejects_invalid_requests_without_changes(self):
+        target = self.root / 'file.pkg'
+        target.write_bytes(b'0123456789')
+        invalid = ('', 'file.pkg', 'file.pkg 0', 'file.pkg 0 0',
+                   'file.pkg 0 gg', 'file.pkg 0 00 zz', 'file.pkg -1 ff',
+                   'file.pkg +1 ff', 'file.pkg 1x ff',
+                   'file.pkg 9223372036854775808 ff',
+                   'file.pkg 0 ' + 'ff' * 1025,
+                   '"file.pkg 0 ff', '"file.pkg"x 0 ff',
+                   '"bad\\q" 0 ff', '"" 0 ff')
+        for args in invalid:
+            with self.subTest(args=args[:80]):
+                with self.assertRaisesRegex(ftplib.error_perm, '^501'):
+                    self.ftp.sendcmd('SITE PWRITE ' + args)
+                self.assertEqual(target.read_bytes(), b'0123456789')
+        for offset in (9, 10, 11, 9223372036854775807):
+            with self.subTest(offset=offset):
+                with self.assertRaisesRegex(ftplib.error_perm, '^551'):
+                    self.ftp.sendcmd(f'SITE PWRITE file.pkg {offset} aabb')
+                self.assertEqual(target.read_bytes(), b'0123456789')
+
+    def test_pwrite_large_offset(self):
+        target = self.root / 'large.pkg'
+        offset = 5 * 1024 ** 3 + 17
+        with target.open('wb') as file:
+            file.truncate(offset + 8)
+        self.ftp.sendcmd(f'SITE PWRITE large.pkg {offset} 00aAff')
+        self.assertEqual(target.stat().st_size, offset + 8)
+        with target.open('rb') as file:
+            file.seek(offset - 1)
+            self.assertEqual(file.read(5), b'\x00\x00\xaa\xff\x00')
+
+    def test_pwrite_preserves_block_connection(self):
+        self.block_mode()
+        data = self.block_upload('STOR block-patch.pkg', b'0123456789')
+        self.ftp.sendcmd('SITE PWRITE block-patch.pkg 0 aabb')
+        self.assertEqual((self.root / 'block-patch.pkg').read_bytes(),
+                         b'\xaa\xbb23456789')
+        self.block_upload('STOR after-patch.pkg', b'healthy', data)
+        self.assertEqual((self.root / 'after-patch.pkg').read_bytes(), b'healthy')
+
+    def test_pwrite_requires_existing_regular_file(self):
+        (self.root / 'dir').mkdir()
+        (self.root / 'file.pkg').write_bytes(b'unchanged')
+        (self.root / 'link').symlink_to('file.pkg')
+        os.mkfifo(self.root / 'fifo')
+        for name in ('missing', 'dir', 'link', 'fifo'):
+            with self.subTest(name=name):
+                with self.assertRaises(ftplib.error_perm):
+                    self.ftp.sendcmd(f'SITE PWRITE {name} 0 ff')
+        self.assertFalse((self.root / 'missing').exists())
+        self.assertEqual((self.root / 'file.pkg').read_bytes(), b'unchanged')
+
     def test_append_creates_and_preserves_contents(self):
         target = self.root / "append.bin"
         self.ftp.storbinary("APPE append.bin", io.BytesIO(b"first"))

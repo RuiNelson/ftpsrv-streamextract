@@ -112,6 +112,7 @@ static ftp_command_t commands[] = {
   {"SELF", ftp_cmd_SELF},
   {"SCHK", ftp_cmd_SELFCHK},
   {"CHMOD", ftp_cmd_CHMOD},
+  {"PWRITE", ftp_cmd_PWRITE},
   {"UMASK", ftp_cmd_UMASK},
   {"SYMLINK", ftp_cmd_SYMLINK},
   {"RMDIR", ftp_cmd_RMDA},

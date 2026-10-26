@@ -6290,6 +6290,106 @@ ftp_cmd_SIZE(ftp_env_t *env, const char* arg) {
 }
 
  
+/* PWRITE carries at most 1 KiB of decoded bytes on the control connection. */
+#define FTP_PWRITE_MAX 1024
+
+static int
+ftp_hex_digit(unsigned char c) {
+  if(c >= '0' && c <= '9') return c - '0';
+  if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+int
+ftp_cmd_PWRITE(ftp_env_t *env, const char *arg) {
+  char name[PATH_MAX], path[PATH_MAX];
+  unsigned char data[FTP_PWRITE_MAX];
+  const char *p = arg;
+  size_t n = 0, length;
+  char *end;
+  long long offset;
+  struct stat st;
+  int fd, failed, saved_errno;
+  int flags = O_WRONLY | O_NONBLOCK;
+#ifdef O_CLOEXEC
+  flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+  flags |= O_NOFOLLOW;
+#endif
+
+  /* Quoted paths escape a literal quote or backslash with a backslash. */
+  int quoted = *p == '"';
+  if(quoted) p++;
+  while(*p && (quoted ? *p != '"' : *p != ' ')) {
+    if(quoted && *p == '\\') {
+      p++;
+      if(*p != '"' && *p != '\\') goto syntax;
+    }
+    if((unsigned char)*p < 0x20 || *p == 0x7f ||
+       n + 1 >= sizeof(name)) goto syntax;
+    name[n++] = *p++;
+  }
+  if(!n) goto syntax;
+  name[n] = '\0';
+  if(quoted) {
+    if(*p != '"') goto syntax;
+    p++;
+  }
+  if(*p != ' ') goto syntax;
+  p += strspn(p, " ");
+  if(*p < '0' || *p > '9') goto syntax;
+  errno = 0;
+  offset = strtoll(p, &end, 10);
+  if(errno || (off_t)offset != offset || *end != ' ') goto syntax;
+  p = end + strspn(end, " ");
+  length = strlen(p);
+  if(!length || length % 2 || length > 2 * FTP_PWRITE_MAX) goto syntax;
+  length /= 2;
+  for(n = 0; n < length; n++) {
+    int hi = ftp_hex_digit((unsigned char)p[2 * n]);
+    int lo = ftp_hex_digit((unsigned char)p[2 * n + 1]);
+    if(hi < 0 || lo < 0) goto syntax;
+    data[n] = (unsigned char)((hi << 4) | lo);
+  }
+
+  if(ftp_abspath(env, path, sizeof(path), name)) return ftp_perror(env);
+  if(lstat(path, &st)) return ftp_perror(env);
+  if(!S_ISREG(st.st_mode))
+    return ftp_active_printf(env, "550 Not a regular file\r\n");
+  fd = open(path, flags);
+  if(fd < 0) return ftp_perror(env);
+  if(fstat(fd, &st)) {
+    saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return ftp_perror(env);
+  }
+  if(!S_ISREG(st.st_mode)) {
+    close(fd);
+    return ftp_active_printf(env, "550 Not a regular file\r\n");
+  }
+  /* Subtraction avoids offset+length overflow. Never extend the file. */
+  if((off_t)offset > st.st_size || (uintmax_t)length >
+     (uintmax_t)(st.st_size - (off_t)offset)) {
+    close(fd);
+    return ftp_active_printf(env, "551 Patch beyond EOF\r\n");
+  }
+  failed = io_pwrite(fd, data, length, (off_t)offset);
+  saved_errno = errno;
+  if(close(fd) && !failed) return ftp_perror(env);
+  if(failed) {
+    errno = saved_errno;
+    return ftp_perror(env);
+  }
+  return ftp_active_printf(env, "250 PWRITE OK\r\n");
+
+syntax:
+  return ftp_active_printf(env,
+      "501 Usage: SITE PWRITE <path> <offset> <hex-data> (1-1024 bytes)\r\n");
+}
+
 /**
  * Store received data in a given file, optionally appending atomically.
  **/
@@ -6549,6 +6649,7 @@ ftp_cmd_FEAT(ftp_env_t *env, const char *arg) {
                            " STOP\r\n"
                            " SELF\r\n"
                            " SCHK\r\n"
+                           " SITE PWRITE\r\n"
                            " SITE CHMOD\r\n"
                            " SITE UMASK\r\n"
                            " SITE SYMLINK\r\n"
@@ -6760,7 +6861,7 @@ ftp_cmd_HELP(ftp_env_t *env, const char *arg) {
                            " LIST NLST MLSD MLST RETR STOR APPE\r\n"
                            " DELE RMD RMDA MKD RNFR RNTO REST LOWER UPPER STOP XQUOTA\r\n"
                            " PASV PORT EPSV EPRT SYST NOOP QUIT\r\n"
-                           " SITE CHMOD UMASK SYMLINK RMDIR CPFR CPTO COPY MOVE LOWER UPPER STOP AUTHID\r\n"
+                           " SITE PWRITE CHMOD UMASK SYMLINK RMDIR CPFR CPTO COPY MOVE LOWER UPPER STOP AUTHID\r\n"
                            "214 End\r\n");
 }
 
