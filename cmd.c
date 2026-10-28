@@ -6585,8 +6585,8 @@ ftp_store(ftp_env_t *env, const char *arg, int append) {
     if(ftp_mc_recv_file(env, fd, &written)) {
       int saved_errno = errno;
       // Keep only the valid prefix, so SIZE gives the restart point.
-      if(!append) {
-        (void)ftruncate(fd, off + (off_t)written);
+      if(!append && ftruncate(fd, off + (off_t)written)) {
+        FTP_LOG_PERROR("ftruncate(failed FTPMC prefix)");
       }
       close(fd);
       errno = saved_errno;
