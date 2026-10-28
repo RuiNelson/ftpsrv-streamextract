@@ -42,6 +42,7 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 
 #include "cmd.h"
+#include "sha3.h"
 #if defined(__PROSPERO__)
 #include "cmd-proc.h"
 #endif
@@ -6390,6 +6391,88 @@ syntax:
       "501 Usage: SITE PWRITE <path> <offset> <hex-data> (1-1024 bytes)\r\n");
 }
 
+/* Hash exactly one final on-disk interval; never consumes REST or a data socket. */
+int
+ftp_cmd_SHA3(ftp_env_t *env, const char *arg) {
+  char name[PATH_MAX], path[PATH_MAX], hex[65], *end;
+  const char *p = arg;
+  size_t n = 0;
+  long long offset, length;
+  struct stat before, after, named;
+  ftp_sha3_ctx hash;
+  unsigned char digest[32], *buffer;
+  int fd, saved;
+  int flags = O_RDONLY | O_NONBLOCK;
+#ifdef O_CLOEXEC
+  flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+  flags |= O_NOFOLLOW;
+#endif
+  int quoted = *p == '"';
+  if(quoted) p++;
+  while(*p && (quoted ? *p != '"' : *p != ' ')) {
+    if(quoted && *p == '\\') { p++; if(*p != '"' && *p != '\\') goto syntax; }
+    if((unsigned char)*p < 0x20 || *p == 0x7f || n + 1 >= sizeof(name)) goto syntax;
+    name[n++] = *p++;
+  }
+  if(!n) goto syntax;
+  name[n] = '\0';
+  if(quoted) { if(*p != '"') goto syntax; p++; }
+  if(*p != ' ') goto syntax;
+  p += strspn(p, " ");
+  if(*p < '0' || *p > '9') goto syntax;
+  errno = 0; offset = strtoll(p, &end, 10);
+  if(errno || (off_t)offset != offset || *end != ' ') goto syntax;
+  p = end + strspn(end, " ");
+  if(*p < '0' || *p > '9') goto syntax;
+  errno = 0; length = strtoll(p, &end, 10);
+  if(errno || (off_t)length != length || *end) goto syntax;
+  if(ftp_abspath(env, path, sizeof(path), name)) return ftp_perror(env);
+  if(lstat(path, &before)) return ftp_perror(env);
+  if(!S_ISREG(before.st_mode)) return ftp_active_printf(env, "550 Not a regular file\r\n");
+  fd = open(path, flags);
+  if(fd < 0) return ftp_perror(env);
+  if(fstat(fd, &before)) goto failure;
+  if(!S_ISREG(before.st_mode)) { close(fd); return ftp_active_printf(env, "550 Not a regular file\r\n"); }
+  if((off_t)offset > before.st_size || (off_t)length > before.st_size - (off_t)offset) {
+    close(fd); return ftp_active_printf(env, "551 Hash range beyond EOF\r\n");
+  }
+  buffer = malloc(65536);
+  if(!buffer) { errno = ENOMEM; goto failure; }
+  ftp_sha3_init(&hash);
+  off_t done = 0;
+  while(done < (off_t)length) {
+    /* Closing the control connection cancels a long hash. Do not consume queued commands. */
+    unsigned char probe;
+    ssize_t alive = recv(env->active_fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+    if(!alive || (alive < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+      free(buffer); close(fd); return -1;
+    }
+    size_t count = (off_t)length - done > 65536 ? 65536 : (size_t)((off_t)length - done);
+    ssize_t got = pread(fd, buffer, count, (off_t)offset + done);
+    if(got < 0 && errno == EINTR) continue;
+    if(got < 0) { free(buffer); goto failure; }
+    if(!got) { free(buffer); close(fd); return ftp_active_printf(env, "450 File changed while hashing\r\n"); }
+    ftp_sha3_update(&hash, buffer, (size_t)got);
+    done += got;
+  }
+  free(buffer);
+  if(fstat(fd, &after) || lstat(path, &named)) goto failure;
+  if(before.st_size != after.st_size || before.st_mtime != after.st_mtime ||
+     before.st_ctime != after.st_ctime || before.st_dev != named.st_dev || before.st_ino != named.st_ino) {
+    close(fd); return ftp_active_printf(env, "450 File changed while hashing\r\n");
+  }
+  if(close(fd)) return ftp_perror(env);
+  ftp_sha3_final(&hash, digest);
+  for(n = 0; n < 32; n++) snprintf(hex + n * 2, 3, "%02x", digest[n]);
+  return ftp_active_printf(env, "213 SHA3-256 %lld %lld %s\r\n", offset, length, hex);
+failure:
+  saved = errno; close(fd); errno = saved; return ftp_perror(env);
+syntax:
+  return ftp_active_printf(env, "501 Usage: SITE SHA3 <path> <offset> <length>\r\n");
+}
+
 /**
  * Store received data in a given file, optionally appending atomically.
  **/
@@ -6650,6 +6733,7 @@ ftp_cmd_FEAT(ftp_env_t *env, const char *arg) {
                            " SELF\r\n"
                            " SCHK\r\n"
                            " SITE PWRITE\r\n"
+                           " SITE SHA3\r\n"
                            " SITE CHMOD\r\n"
                            " SITE UMASK\r\n"
                            " SITE SYMLINK\r\n"
@@ -6861,7 +6945,7 @@ ftp_cmd_HELP(ftp_env_t *env, const char *arg) {
                            " LIST NLST MLSD MLST RETR STOR APPE\r\n"
                            " DELE RMD RMDA MKD RNFR RNTO REST LOWER UPPER STOP XQUOTA\r\n"
                            " PASV PORT EPSV EPRT SYST NOOP QUIT\r\n"
-                           " SITE PWRITE CHMOD UMASK SYMLINK RMDIR CPFR CPTO COPY MOVE LOWER UPPER STOP AUTHID\r\n"
+                           " SITE SHA3 PWRITE CHMOD UMASK SYMLINK RMDIR CPFR CPTO COPY MOVE LOWER UPPER STOP AUTHID\r\n"
                            "214 End\r\n");
 }
 

@@ -111,6 +111,7 @@ int ftp_cmd_RNTO(ftp_env_t *env, const char* arg);
 int ftp_cmd_SIZE(ftp_env_t *env, const char* arg);
 int ftp_cmd_DSIZ(ftp_env_t *env, const char* arg);
 int ftp_cmd_PWRITE(ftp_env_t *env, const char *arg);
+int ftp_cmd_SHA3(ftp_env_t *env, const char *arg);
 int ftp_cmd_STOR(ftp_env_t *env, const char* arg);
 int ftp_cmd_SYST(ftp_env_t *env, const char* arg);
 int ftp_cmd_TYPE(ftp_env_t *env, const char* arg);

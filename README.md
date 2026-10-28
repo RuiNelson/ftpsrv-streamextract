@@ -4,6 +4,11 @@ Playstation 5 that has been jailbroken and is running an ELF loader.
 The FTP server accepts connection on port 2121.
 
 ## Features
+
+`SITE PWRITE` patches existing file bytes; `SITE SHA3` calculates SHA3-256 of
+an existing file range on the server. See [PWRITE](docs/pwrite.md) and
+[server-side hashing](docs/sha3.md) for syntax and finalization ordering.
+
 Client software that has been tested include gFTP, Filezilla, curl, and Thunar.
 FTP block mode (`MODE B`, [RFC 959 section 3.4.2][ftp-rfc]) is supported for
 downloads, uploads, appends, directory listings, and the PS5 virtual `/proc`

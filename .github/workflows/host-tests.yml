@@ -1,0 +1,21 @@
+name: Host regressions
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            makefile: Makefile.linux
+          - os: macos-14
+            makefile: Makefile.macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: make -f ${{ matrix.makefile }} check

@@ -2,6 +2,7 @@
 """Local file-transfer regression checks; uses only the Python standard library."""
 
 import ftplib
+import hashlib
 import io
 import os
 from pathlib import Path
@@ -105,6 +106,67 @@ class Transfers(unittest.TestCase):
         self.ftp.storbinary("STOR data.bin", io.BytesIO(b"abc"), rest=5)
         self.assertEqual(target.read_bytes(), b"01234abc")
         self.assertEqual(self.download("data.bin", rest=5), b"abc")
+
+    def sha3(self, name, offset, length):
+        quoted = '"' + name.replace('\\', '\\\\').replace('"', '\\"') + '"'
+        reply = self.ftp.sendcmd(f"SITE SHA3 {quoted} {offset} {length}")
+        prefix = f"213 SHA3-256 {offset} {length} "
+        self.assertTrue(reply.startswith(prefix), reply)
+        return reply[len(prefix):]
+
+    def test_sha3_vectors_and_ranges(self):
+        self.assertIn("SITE SHA3", self.ftp.sendcmd("FEAT"))
+        name = 'game "quoted" \\ hash.pkg'
+        data = bytes(range(256)) * 4097
+        target = self.root / name
+        target.write_bytes(data)
+        lengths = list(range(280)) + [65535, 65536, 65537, len(data)]
+        for length in lengths:
+            with self.subTest(length=length):
+                self.assertEqual(self.sha3(name, 0, length), hashlib.sha3_256(data[:length]).hexdigest())
+        for offset, length in [(1, 137), (65530, 70000), (len(data), 0)]:
+            self.assertEqual(self.sha3(name, offset, length), hashlib.sha3_256(data[offset:offset + length]).hexdigest())
+        self.assertEqual(target.read_bytes(), data)
+        # A hash does not consume transfer restart state.
+        self.ftp.sendcmd("REST 3")
+        self.sha3(name, 0, 1)
+        self.assertEqual(self.download(name), data[3:])
+
+    def test_sha3_rejects_bad_input_and_special_files(self):
+        target = self.root / 'file.pkg'
+        target.write_bytes(b'0123456789')
+        for args in ['', 'file.pkg', 'file.pkg 0', 'file.pkg -1 1', 'file.pkg +0 1',
+                     'file.pkg 0 -1', 'file.pkg 0 +1', 'file.pkg 0 1x', 'file.pkg 0 1 extra',
+                     'file.pkg 9223372036854775808 0', 'file.pkg 0 9223372036854775808',
+                     '"unterminated 0 1']:
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(ftplib.error_perm, '^501'):
+                    self.ftp.sendcmd('SITE SHA3 ' + args)
+        for offset, length in [(11, 0), (9, 2), (10, 1), (0, 9223372036854775807)]:
+            with self.assertRaisesRegex(ftplib.error_perm, '^551'):
+                self.sha3('file.pkg', offset, length)
+        (self.root / 'link').symlink_to(target)
+        os.mkfifo(self.root / 'pipe')
+        for name in ['link', 'pipe', '.', 'missing']:
+            with self.assertRaises(ftplib.error_perm):
+                self.sha3(name, 0, 0)
+        self.assertEqual(target.read_bytes(), b'0123456789')
+
+    def test_sha3_large_offset_and_patch_append_sequence(self):
+        offset = (1 << 32) + 17
+        target = self.root / 'large.pkg'
+        with target.open('wb') as file:
+            file.seek(offset)
+            file.write(b'abcdefgh')
+        self.assertEqual(self.sha3('large.pkg', offset, 8), hashlib.sha3_256(b'abcdefgh').hexdigest())
+        self.ftp.storbinary('STOR mount.part', io.BytesIO(b'0000payloadCNT'))
+        self.ftp.sendcmd('SITE PWRITE mount.part 0 46494821')
+        mount = b'FIH!payloadCNT'
+        expected = hashlib.sha3_256(mount).hexdigest()
+        self.assertEqual(self.sha3('mount.part', 0, len(mount)), expected)
+        self.ftp.storbinary('APPE mount.part', io.BytesIO(b'SI'))
+        self.assertEqual(self.sha3('mount.part', 0, len(mount)), expected)
+        self.assertEqual(self.download('mount.part'), mount + b'SI')
 
     def test_pwrite_preserves_file_and_session_state(self):
         self.assertIn("SITE PWRITE", self.ftp.sendcmd("FEAT"))
